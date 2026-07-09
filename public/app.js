@@ -318,30 +318,253 @@ async function saveCommute() {
   const incomplete = commute.legs.filter((l) => !l.from_id || !l.to_id || (l.mode === "tube" && !l.line));
   if (!commute.legs.length) { alert("Add at least one leg first."); return; }
   if (incomplete.length) { alert("Some legs are missing their stops — finish those first."); return; }
+  // For bus legs, resolve the opposite-direction stops so the evening (reverse) journey
+  // boards at the right stop. Uses the route's other direction sequence.
+  for (const leg of commute.legs) {
+    if (leg.mode === "bus" && leg._routeDirs && leg._routeDirs.length > 1 && leg._dirIdx != null) {
+      const other = leg._routeDirs[leg._dirIdx === 0 ? 1 : 0];
+      // On the return we board near our AM destination and alight near our AM origin.
+      const byName = (nm) => other.stops.find((s) => s.name === nm)?.id || null;
+      leg.rev_from_id = byName(leg.to_name) || null;
+      leg.rev_to_id = byName(leg.from_name) || null;
+    }
+    // strip transient fields before saving
+    delete leg._routeDirs; delete leg._lineStops; delete leg._collapsed; delete leg._lineCollapsed;
+  }
   await apiSave(commute);
   await bootHome();
 }
 
 /* ============================================================
-   HOME (placeholder for Pass 1 — Pass 2 builds live cards)
+   HOME — live
    ============================================================ */
+let direction = "am";           // "am" (as set up) | "pm" (reversed)
+let boards = {};                // legId -> board data
+let dirCache = {};              // cache for tube direction lookups
+let refreshTimer = null;
+let tick = null;
+
+function autoDirection() { return new Date().getHours() < 12 ? "am" : "pm"; }
+
+// Reverse a leg for the PM journey (swap endpoints; tube/rail reverse cleanly).
+function reverseLeg(leg) {
+  return {
+    ...leg, id: leg.id + "-r",
+    from_id: leg.to_id, to_id: leg.from_id,
+    from_name: leg.to_name, to_name: leg.from_name,
+    _reversed: true,
+    // bus: opposite-direction stops resolved lazily; keep route + flip dir token
+    direction: leg.direction === "inbound" ? "outbound" : leg.direction === "outbound" ? "inbound" : leg.direction,
+  };
+}
+function activeLegs() {
+  return direction === "pm" ? commute.legs.slice().reverse().map(reverseLeg) : commute.legs;
+}
+
+function colourFor(leg) {
+  return leg.mode === "tube" ? lineColour(leg.line) : (leg.mode === "rail" ? "#2456E6" : "#C15F3C");
+}
+function titleFor(leg) {
+  return leg.mode === "tube" ? lineName(leg.line) : (leg.mode === "rail" ? "Train" : `Bus ${esc(leg.route || leg.line || "")}`);
+}
+
 function renderHome() {
   show("home");
+  const legs = activeLegs();
+  el("dir-toggle").hidden = legs.length === 0;
+  el("dir-am").classList.toggle("active", direction === "am");
+  el("dir-pm").classList.toggle("active", direction === "pm");
+  el("home-title").textContent = direction === "pm" ? "Heading home" : "Your commute";
+
+  renderDigest(legs);
+
   const wrap = el("commute");
-  el("dir-toggle").hidden = false;
-  wrap.innerHTML = commute.legs.map((leg, i) => {
-    const isLast = i === commute.legs.length - 1;
-    const col = leg.mode === "tube" ? lineColour(leg.line) : (leg.mode === "rail" ? "#2456E6" : "#C15F3C");
-    const title = leg.mode === "tube" ? lineName(leg.line) : (leg.mode === "rail" ? "Train" : `Bus ${esc(leg.route || leg.line)}`);
-    return `<div class="leg" style="--segCol:${col};--nodeCol:${col};transition-delay:${i * 70}ms">
+  wrap.innerHTML = legs.map((leg, i) => {
+    const isLast = i === legs.length - 1;
+    const col = colourFor(leg);
+    const board = boards[leg.id];
+    const st = legStatus(leg, board);
+    return `<div class="leg" style="--segCol:${col};--nodeCol:${col};transition-delay:${i * 60}ms">
       <div class="leg-spine"><div class="leg-node">${MODE_ICON[leg.mode]}</div>${isLast ? "" : '<div class="leg-connector"></div>'}</div>
-      <div class="leg-card" style="--segCol:${col}">
-        <div class="leg-top"><div class="leg-line-name"><span class="leg-swatch" style="background:${col}"></span>${esc(title)}</div>
-        <span class="leg-badge checking">Live soon</span></div>
+      <button class="leg-card ${st.card}" data-leg="${leg.id}" style="--segCol:${col}">
+        <div class="leg-top">
+          <div class="leg-line-name"><span class="leg-swatch" style="background:${col}"></span>${esc(titleFor(leg))}</div>
+          <span class="leg-badge ${st.badge}">${esc(st.label)}</span>
+        </div>
         <div class="leg-route">${esc(leg.from_name)} → ${esc(leg.to_name)}</div>
-      </div></div>`;
+        <div class="times">${renderTimes(leg, board)}</div>
+        ${st.reason ? `<div class="leg-reason">${esc(st.reason)}</div>` : ""}
+      </button></div>`;
   }).join("");
+  wrap.querySelectorAll("[data-leg]").forEach((b) => b.onclick = () => {
+    const leg = legs.find((l) => l.id === b.dataset.leg); if (leg) openLegDetail(leg);
+  });
   revealOnScroll();
+}
+
+function legStatus(leg, board) {
+  if (!board) return { card: "", badge: "checking", label: "…", reason: null };
+  if (leg.mode === "tube") {
+    // status from line status severity if present
+    const sev = board.lineStatusLevel;
+    if (sev != null && sev < 6) return { card: "problem", badge: "bad", label: board.lineStatus || "Disrupted", reason: board.lineReason };
+    if (sev != null && sev < 10) return { card: "problem-amber", badge: "delay", label: board.lineStatus || "Delays", reason: board.lineReason };
+    return { card: "", badge: "good", label: "Good service", reason: null };
+  }
+  if (leg.mode === "bus") {
+    if (board.disruption) return { card: "problem-amber", badge: "delay", label: "Diversion", reason: board.disruption };
+    return { card: "", badge: "good", label: "Running", reason: null };
+  }
+  // rail
+  const svcs = board.services || [];
+  if (svcs.some((s) => s.status === "cancelled")) return { card: "problem", badge: "bad", label: "Cancellations", reason: svcs.find((s) => s.cancelReason)?.cancelReason || null };
+  if (svcs.some((s) => s.status === "delayed")) return { card: "problem-amber", badge: "delay", label: "Delays", reason: svcs.find((s) => s.delayReason)?.delayReason || null };
+  if (!svcs.length) return { card: "", badge: "checking", label: "No live info", reason: null };
+  return { card: "", badge: "good", label: "On time", reason: null };
+}
+
+function renderTimes(leg, board) {
+  if (!board || !board.services || !board.services.length) return '<span class="times-empty">No live times right now</span>';
+  const svcs = board.services.slice(0, 4);
+  return svcs.map((s, i) => {
+    const isNext = i === 0;
+    const cls = s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "";
+    let big, sub;
+    if (leg.mode === "rail") {
+      big = s.status === "cancelled" ? "Canc" : (s.std || s.estimated || "—");
+      sub = s.status === "delayed" && s.estimated ? "exp " + s.estimated : (s.platform ? "Pl " + s.platform : (s.destination || ""));
+    } else {
+      big = s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown + " min") : (s.etd || "—");
+      sub = isNext && s.destination ? "to " + s.destination : "";
+    }
+    return `<div class="time-chip ${isNext ? "next " + cls : ""}"><div class="time-big">${esc(big)}</div>${sub ? `<div class="time-sub">${esc(sub)}</div>` : ""}</div>`;
+  }).join("");
+}
+
+function renderDigest(legs) {
+  const host = el("summary");
+  const issues = legs.map((leg) => ({ leg, st: legStatus(leg, boards[leg.id]) }))
+    .filter((x) => x.st.badge === "bad" || x.st.badge === "delay");
+  const anyLoaded = legs.some((l) => boards[l.id]);
+  if (!anyLoaded) { host.innerHTML = `<div class="summary checking"><span class="dot"></span>Checking your ${direction === "pm" ? "route home" : "commute"}…</div>`; return; }
+  if (!issues.length) {
+    host.innerHTML = `<div class="summary good"><span class="dot"></span><div class="summary-lines"><span class="summary-head">${direction === "pm" ? "Your way home looks clear" : "Your commute looks clear"}</span><span class="summary-sub">Good service on all ${legs.length} leg${legs.length > 1 ? "s" : ""}</span></div></div>`;
+    return;
+  }
+  const lines = issues.map((x) => `<span class="summary-sub">${esc(titleFor(x.leg))} — ${esc(x.st.label)}${x.st.reason ? ": " + esc(x.st.reason) : ""}</span>`).join("");
+  host.innerHTML = `<div class="summary bad"><span class="dot"></span><div class="summary-lines"><span class="summary-head">${issues.length} issue${issues.length > 1 ? "s" : ""} on your ${direction === "pm" ? "way home" : "commute"}</span>${lines}</div></div>`;
+}
+
+/* ---- fetching boards ---- */
+async function tubeDirection(leg) {
+  const key = `${leg.line}|${leg.from_id}|${leg.to_id}`;
+  if (dirCache[key]) return dirCache[key];
+  try {
+    const r = await fetch(`/api/tube/direction?line=${encodeURIComponent(leg.line)}&from=${encodeURIComponent(leg.from_id)}&to=${encodeURIComponent(leg.to_id)}`);
+    const d = await r.json();
+    dirCache[key] = d; return d;
+  } catch (e) { return { direction: null, onward: [] }; }
+}
+
+async function fetchBoard(leg) {
+  if (leg.mode === "tube") {
+    const dir = await tubeDirection(leg);
+    let url = `/api/tube/board?stop=${encodeURIComponent(leg.from_id)}&line=${encodeURIComponent(leg.line)}`;
+    if (dir.direction) url += `&direction=${dir.direction}`;
+    const r = await fetch(url);
+    const board = r.ok ? await r.json() : { services: [] };
+    // Fallback filter by onward destination names when direction token missing.
+    if ((!dir.direction || !board.services?.some((s) => s.direction)) && dir.onward?.length && board.services) {
+      const onward = new Set(dir.onward.map((n) => n.toLowerCase()));
+      const filt = board.services.filter((s) => s.destination && onward.has(s.destination.toLowerCase().replace(/ underground station$/, "").replace(/ station$/, "")));
+      if (filt.length) board.services = filt;
+    }
+    return board;
+  }
+  if (leg.mode === "bus") {
+    const stop = leg._reversed ? (leg.rev_from_id || leg.from_id) : leg.from_id;
+    const r = await fetch(`/api/bus/board?stop=${encodeURIComponent(stop)}&line=${encodeURIComponent(leg.route || leg.line)}`);
+    const board = r.ok ? await r.json() : { services: [] };
+    try {
+      const dr = await fetch(`/api/bus/disruption?lines=${encodeURIComponent(leg.route || leg.line)}`);
+      const dd = await dr.json();
+      if (dd.hasDisruption) board.disruption = dd.disruptions[0]?.description || "Diversion";
+    } catch (e) {}
+    return board;
+  }
+  // rail
+  const r = await fetch(`/api/rail/board?from=${encodeURIComponent(leg.from_id)}&to=${encodeURIComponent(leg.to_id)}`);
+  return r.ok ? await r.json() : { services: [] };
+}
+
+async function loadBoards() {
+  const legs = activeLegs();
+  await Promise.all(legs.map(async (leg) => {
+    try { boards[leg.id] = await fetchBoard(leg); } catch (e) { boards[leg.id] = { services: [] }; }
+  }));
+  renderHome();
+}
+
+/* ---- refresh: button (flashes green), pull-to-refresh, auto 20s ---- */
+async function doRefresh(fromButton) {
+  const btn = el("btn-refresh");
+  btn.classList.remove("ok"); btn.classList.add("spinning");
+  await loadBoards();
+  btn.classList.remove("spinning");
+  btn.classList.add("ok");
+  setTimeout(() => btn.classList.remove("ok"), 1400);
+}
+function startAutoRefresh() {
+  stopAutoRefresh();
+  refreshTimer = setInterval(() => { if (!el("screen-home").hidden) loadBoards(); }, 20000);
+  tick = setInterval(tickCountdowns, 1000);
+}
+function stopAutoRefresh() { clearInterval(refreshTimer); clearInterval(tick); }
+
+// live countdown decrement between fetches (visual only)
+function tickCountdowns() {
+  if (el("screen-home").hidden) return;
+  document.querySelectorAll(".time-chip .time-big").forEach(() => {}); // countdowns refetched every 20s; keep simple
+}
+
+/* pull-to-refresh */
+let touchY = 0, pulling = false;
+function initPull() {
+  const s = el("screen-home");
+  s.addEventListener("touchstart", (e) => { if (window.scrollY <= 0) { touchY = e.touches[0].clientY; pulling = true; } }, { passive: true });
+  s.addEventListener("touchmove", (e) => {
+    if (!pulling) return;
+    const dy = e.touches[0].clientY - touchY;
+    if (dy > 70) { pulling = false; doRefresh(); }
+  }, { passive: true });
+  s.addEventListener("touchend", () => { pulling = false; });
+}
+
+/* ---- leg detail (Pass 3 fills rail; basic for now) ---- */
+function openLegDetail(leg) {
+  show("leg");
+  el("leg-detail-mode").textContent = MODE_LABEL[leg.mode] + " · " + titleFor(leg);
+  const board = boards[leg.id] || { services: [] };
+  const svcs = board.services || [];
+  el("leg-detail-body").innerHTML = `
+    <h2 style="margin-bottom:4px">${esc(leg.from_name)} → ${esc(leg.to_name)}</h2>
+    <p class="hint" style="margin-bottom:18px">${esc(titleFor(leg))}</p>
+    ${svcs.length ? svcs.map((s) => {
+      const big = leg.mode === "rail" ? (s.std || s.estimated || "") : (s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown + " min") : "");
+      return `<div class="detail-row"><span class="detail-time">${esc(big)}</span><span class="detail-dest">${esc(s.destination || "")}</span><span class="leg-badge ${s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "good"}">${esc(s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? "exp " + s.estimated : "Delayed") : (s.platform ? "Pl " + s.platform : "On time"))}</span></div>`;
+    }).join("") : '<p class="hint">No live services right now.</p>'}
+    ${leg.mode === "rail" ? '<p class="hint" style="margin-top:16px">Full live detail — position, formed-by, fastest train — coming next.</p>' : ""}`;
+}
+
+async function bootHome() {
+  const saved = await apiGet();
+  if (saved && saved.legs && saved.legs.length) {
+    commute = saved; await loadTubeLines();
+    direction = autoDirection();
+    renderHome();
+    loadBoards();
+    startAutoRefresh();
+  } else { stopAutoRefresh(); show("create"); }
 }
 
 // Cards rise-and-fade as they enter the viewport.
@@ -350,14 +573,8 @@ function revealOnScroll() {
   if (!("IntersectionObserver" in window)) { items.forEach((n) => n.classList.add("in")); return; }
   const io = new IntersectionObserver((entries) => {
     entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } });
-  }, { threshold: 0.15, rootMargin: "0px 0px -40px 0px" });
+  }, { threshold: 0.12, rootMargin: "0px 0px -30px 0px" });
   items.forEach((n) => io.observe(n));
-}
-
-async function bootHome() {
-  const saved = await apiGet();
-  if (saved && saved.legs && saved.legs.length) { commute = saved; await loadTubeLines(); renderHome(); }
-  else { show("create"); }
 }
 
 /* ============================================================
@@ -370,8 +587,10 @@ el("btn-add-leg").onclick = () => { commute.legs.forEach((l) => { if (legComplet
 el("btn-save").onclick = () => saveCommute();
 el("btn-delete-all").onclick = async () => { if (!confirm("Delete your whole commute? This can't be undone.")) return; await apiDelete(); commute = { legs: [], alerts: [] }; show("create"); };
 el("btn-leg-back").onclick = () => renderHome();
-el("dir-am").onclick = () => renderHome();
-el("dir-pm").onclick = () => renderHome();
+el("btn-refresh").onclick = () => doRefresh(true);
+el("dir-am").onclick = () => { direction = "am"; boards = {}; renderHome(); loadBoards(); };
+el("dir-pm").onclick = () => { direction = "pm"; boards = {}; renderHome(); loadBoards(); };
+initPull();
 
 /* ---- boot ---- */
 (async function () {

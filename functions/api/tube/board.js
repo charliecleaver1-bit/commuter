@@ -72,15 +72,20 @@ export async function onRequest(context) {
     // 2) Line status → a human disruption reason if the line isn't in Good Service.
     let disruptionReason = null;
     let severity = "on_time";
+    let lineStatusDesc = "Good Service";
+    let lineStatusLevel = 10;
     if (line) {
       const sResp = await fetch(`${TFL}/Line/${line}/Status${auth(env)}`, { headers: { Accept: "application/json" } });
       if (sResp.ok) {
         const status = await sResp.json();
         const ls = status?.[0]?.lineStatuses?.[0];
-        if (ls && ls.statusSeverity !== 10) {
-          // 10 = Good Service. Anything else carries a reason.
-          disruptionReason = ls.reason || ls.statusSeverityDescription || null;
-          severity = /part|minor/i.test(ls.statusSeverityDescription || "") ? "delayed" : "delayed";
+        if (ls) {
+          lineStatusDesc = ls.statusSeverityDescription || "Good Service";
+          lineStatusLevel = typeof ls.statusSeverity === "number" ? ls.statusSeverity : 10;
+          if (ls.statusSeverity !== 10) {
+            disruptionReason = ls.reason || ls.statusSeverityDescription || null;
+            severity = "delayed";
+          }
         }
       }
     }
@@ -114,6 +119,9 @@ export async function onRequest(context) {
         generatedAt: new Date().toISOString(),
         locationName: arrivals[0]?.stationName || stop,
         nrccMessages: disruptionReason ? [disruptionReason] : [],
+        lineStatus: lineStatusDesc,
+        lineStatusLevel,
+        lineReason: disruptionReason,
         services,
       },
       200,
