@@ -301,15 +301,23 @@ function stationField(label, val, which) {
 }
 
 async function checkDirect(from, to) {
+  // The timetable is authoritative (national, all-day). Sample weekday + Saturday across
+  // several times; if any returns a direct service, it's direct.
+  let timetableWorked = false;
   try {
-    for (const day of ["MO", "SA"]) for (const when of ["08:00", "12:00", "17:00"]) {
+    for (const day of ["MO", "SA"]) for (const when of ["07:30", "12:00", "17:30"]) {
       const r = await fetch(`/api/rail/timetable?from=${from}&to=${to}&when=${when}&day=${day}&span=240`);
       if (!r.ok) continue;
+      timetableWorked = true;
       const d = await r.json();
       if (d.services && d.services.length) return true;
     }
   } catch (e) {}
-  try { const r = await fetch(`/api/rail/validate?from=${from}&to=${to}`); const d = await r.json(); if (d.direct || d.windowEmpty) return true; } catch (e) {}
+  // If the timetable answered (even if empty), trust it: no direct train.
+  if (timetableWorked) return false;
+  // Only if the timetable was unreachable do we fall back to the live board, and only a
+  // POSITIVE result counts — an empty board is NOT proof of a direct train.
+  try { const r = await fetch(`/api/rail/validate?from=${from}&to=${to}`); const d = await r.json(); if (d.direct === true) return true; } catch (e) {}
   return false;
 }
 
@@ -405,6 +413,7 @@ function renderHome() {
 function legStatus(leg, board) {
   if (!board) return { card: "", badge: "checking", label: "…", reason: null };
   if (leg.mode === "tube") {
+    if (board._awaitingDir) return { card: "", badge: "checking", label: "Checking…", reason: null };
     // status from line status severity if present
     const sev = board.lineStatusLevel;
     if (sev != null && sev < 6) return { card: "problem", badge: "bad", label: board.lineStatus || "Disrupted", reason: board.lineReason };
@@ -424,6 +433,7 @@ function legStatus(leg, board) {
 }
 
 function renderTimes(leg, board) {
+  if (leg.mode === "tube" && board && board._awaitingDir) return '<span class="times-empty">Checking direction…</span>';
   if (!board || !board.services || !board.services.length) return '<span class="times-empty">No live times right now</span>';
   const svcs = board.services.slice(0, 4);
   return svcs.map((s, i) => {
@@ -456,24 +466,32 @@ function renderDigest(legs) {
 }
 
 /* ---- fetching boards ---- */
-async function tubeDirection(leg) {
-  const key = `${leg.line}|${leg.from_id}|${leg.to_id}`;
-  if (dirCache[key]) return dirCache[key];
-  try {
-    const r = await fetch(`/api/tube/direction?line=${encodeURIComponent(leg.line)}&from=${encodeURIComponent(leg.from_id)}&to=${encodeURIComponent(leg.to_id)}`);
-    const d = await r.json();
-    dirCache[key] = d; return d;
-  } catch (e) { return { direction: null, onward: [] }; }
+async function loadBoards() {
+  const legs = activeLegs();
+  // Render each card as its board arrives, rather than blocking on the slowest.
+  await Promise.all(legs.map(async (leg) => {
+    try { boards[leg.id] = await fetchBoard(leg); } catch (e) { boards[leg.id] = { services: [] }; }
+    if (!el("screen-home").hidden) renderHome();
+  }));
 }
 
 async function fetchBoard(leg) {
   if (leg.mode === "tube") {
-    const dir = await tubeDirection(leg);
+    // Fetch the board immediately (fast). If we don't yet know the direction for this
+    // leg, mark the board as awaiting-direction so the card shows "Checking direction…"
+    // rather than briefly flashing trains going both ways. warmDirection() then resolves
+    // it and re-renders this card filtered.
+    const key = `${leg.line}|${leg.from_id}|${leg.to_id}`;
+    const dir = dirCache[key];
     let url = `/api/tube/board?stop=${encodeURIComponent(leg.from_id)}&line=${encodeURIComponent(leg.line)}`;
-    if (dir.direction) url += `&direction=${dir.direction}`;
+    if (dir?.direction) url += `&direction=${dir.direction}`;
     const r = await fetch(url);
     const board = r.ok ? await r.json() : { services: [] };
-    // Fallback filter by onward destination names when direction token missing.
+    if (!dir) {
+      board._awaitingDir = true;      // card renders "Checking direction…"
+      warmDirection(leg);             // resolve + re-render this leg
+      return board;
+    }
     if ((!dir.direction || !board.services?.some((s) => s.direction)) && dir.onward?.length && board.services) {
       const onward = new Set(dir.onward.map((n) => n.toLowerCase()));
       const filt = board.services.filter((s) => s.destination && onward.has(s.destination.toLowerCase().replace(/ underground station$/, "").replace(/ station$/, "")));
@@ -492,17 +510,23 @@ async function fetchBoard(leg) {
     } catch (e) {}
     return board;
   }
-  // rail
   const r = await fetch(`/api/rail/board?from=${encodeURIComponent(leg.from_id)}&to=${encodeURIComponent(leg.to_id)}`);
   return r.ok ? await r.json() : { services: [] };
 }
 
-async function loadBoards() {
-  const legs = activeLegs();
-  await Promise.all(legs.map(async (leg) => {
-    try { boards[leg.id] = await fetchBoard(leg); } catch (e) { boards[leg.id] = { services: [] }; }
-  }));
-  renderHome();
+// Warm the direction cache in the background, then re-render once so filtering applies.
+async function warmDirection(leg) {
+  const key = `${leg.line}|${leg.from_id}|${leg.to_id}`;
+  if (dirCache[key]) return;
+  try {
+    const r = await fetch(`/api/tube/direction?line=${encodeURIComponent(leg.line)}&from=${encodeURIComponent(leg.from_id)}&to=${encodeURIComponent(leg.to_id)}`);
+    dirCache[key] = r.ok ? await r.json() : { direction: null, onward: [] };
+  } catch (e) {
+    dirCache[key] = { direction: null, onward: [] };   // cache the miss so we don't loop
+  }
+  // Re-fetch this leg's board now that direction is known (or known-unavailable).
+  try { boards[leg.id] = await fetchBoard(leg); } catch (e) {}
+  if (!el("screen-home").hidden) renderHome();
 }
 
 /* ---- refresh: button (flashes green), pull-to-refresh, auto 20s ---- */

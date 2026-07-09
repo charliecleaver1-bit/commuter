@@ -31,7 +31,7 @@ export async function onRequest(context) {
       const seq = await r.json();
       const stops = [];
       const seen = new Set();
-      for (const sps of seq.orderedLineRoutes ? [] : (seq.stopPointSequences || [])) {
+      for (const sps of (seq.stopPointSequences || [])) {
         for (const sp of sps.stopPoint || []) {
           if (seen.has(sp.id)) continue;
           seen.add(sp.id);
