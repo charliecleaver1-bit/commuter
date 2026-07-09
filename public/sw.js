@@ -1,4 +1,4 @@
-const SHELL = "commuter-v1";
+const SHELL = "commuter-v2";
 const FILES = ["/", "/index.html", "/styles.css", "/app.js", "/manifest.webmanifest"];
 self.addEventListener("install", (e) => { e.waitUntil(caches.open(SHELL).then((c) => c.addAll(FILES)).then(() => self.skipWaiting())); });
 self.addEventListener("activate", (e) => { e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== SHELL).map((k) => caches.delete(k)))).then(() => self.clients.claim())); });

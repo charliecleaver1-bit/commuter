@@ -74,11 +74,15 @@ function show(screen) {
 /* ============================================================
    SETUP
    ============================================================ */
-function newLeg() { return { id: "leg" + Date.now() + Math.random().toString(36).slice(2, 5), mode: "tube", line: "", from_id: "", from_name: "", to_id: "", to_name: "", _valid: null }; }
+function newLeg() { return { id: "leg" + Date.now() + Math.random().toString(36).slice(2, 5), mode: "tube", line: "", from_id: "", from_name: "", to_id: "", to_name: "", _valid: null, _collapsed: false, _lineCollapsed: false }; }
 
 function renderSetup() {
   show("setup");
   renderSetupLegs();
+}
+
+function legComplete(leg) {
+  return leg.from_id && leg.to_id && (leg.mode !== "tube" || leg.line);
 }
 
 function renderSetupLegs() {
@@ -86,11 +90,29 @@ function renderSetupLegs() {
   host.innerHTML = "";
   commute.legs.forEach((leg, i) => {
     const div = document.createElement("div");
-    div.className = "setup-leg";
+    div.className = "setup-leg" + (leg._collapsed && legComplete(leg) ? " collapsed" : "");
+
+    if (leg._collapsed && legComplete(leg)) {
+      // Collapsed summary row — tap to reopen.
+      const col = leg.mode === "tube" ? lineColour(leg.line) : (leg.mode === "rail" ? "#2456E6" : "#C15F3C");
+      const title = leg.mode === "tube" ? lineName(leg.line) : (leg.mode === "rail" ? "Train" : `Bus ${esc(leg.route || "")}`);
+      div.innerHTML = `
+        <button class="leg-summary" data-open>
+          <span class="setup-leg-num">${i + 1}</span>
+          <span class="sum-sw" style="background:${col}"></span>
+          <span class="sum-main"><span class="sum-title">${esc(title)}</span><span class="sum-route">${esc(leg.from_name)} → ${esc(leg.to_name)}</span></span>
+          <span class="sum-edit">Edit</span>
+        </button>`;
+      div.querySelector("[data-open]").onclick = () => { leg._collapsed = false; renderSetupLegs(); };
+      host.appendChild(div);
+      return;
+    }
+
     div.innerHTML = `
       <div class="setup-leg-head">
         <span class="setup-leg-num">${i + 1}</span>
         <span class="sp"></span>
+        ${legComplete(leg) ? '<button class="mini-btn" data-collapse title="Collapse">▲</button>' : ""}
         <button class="mini-btn" data-up ${i === 0 ? "disabled" : ""}>↑</button>
         <button class="mini-btn" data-down ${i === commute.legs.length - 1 ? "disabled" : ""}>↓</button>
         <button class="mini-btn" data-del>✕</button>
@@ -101,6 +123,8 @@ function renderSetupLegs() {
       <div data-body></div>`;
     div.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => { resetLeg(leg, b.dataset.mode); renderSetupLegs(); });
     div.querySelector("[data-del]").onclick = () => { commute.legs.splice(i, 1); renderSetupLegs(); };
+    const collapseBtn = div.querySelector("[data-collapse]");
+    if (collapseBtn) collapseBtn.onclick = () => { leg._collapsed = true; renderSetupLegs(); };
     const up = div.querySelector("[data-up]"); if (i > 0) up.onclick = () => { [commute.legs[i - 1], commute.legs[i]] = [commute.legs[i], commute.legs[i - 1]]; renderSetupLegs(); };
     const down = div.querySelector("[data-down]"); if (i < commute.legs.length - 1) down.onclick = () => { [commute.legs[i + 1], commute.legs[i]] = [commute.legs[i], commute.legs[i + 1]]; renderSetupLegs(); };
     renderLegBody(div.querySelector("[data-body]"), leg);
@@ -122,6 +146,20 @@ function renderLegBody(host, leg) {
 /* ---- TUBE: line first, then two stops on it ---- */
 async function renderTubeBody(host, leg) {
   await loadTubeLines();
+  if (leg.line && leg._lineCollapsed) {
+    // Collapsed: show the chosen line as a compact bar with "Change".
+    host.innerHTML = `
+      <label class="field-label">Line <span class="req">*</span></label>
+      <button class="line-chosen" data-change>
+        <span class="sw" style="background:${lineColour(leg.line)}"></span>
+        <span class="line-chosen-name">${esc(lineName(leg.line))}</span>
+        <span class="line-chosen-change">Change</span>
+      </button>
+      <div data-stops></div>`;
+    host.querySelector("[data-change]").onclick = () => { leg._lineCollapsed = false; renderSetupLegs(); };
+    await renderTubeStops(host.querySelector("[data-stops]"), leg);
+    return;
+  }
   host.innerHTML = `
     <label class="field-label">Line <span class="req">*</span></label>
     <div class="line-grid" data-lines></div>
@@ -129,7 +167,10 @@ async function renderTubeBody(host, leg) {
   const grid = host.querySelector("[data-lines]");
   grid.innerHTML = TUBE_LINES.map((l) => `<button class="line-pill ${leg.line === l.id ? "on" : ""}" data-line="${l.id}"><span class="sw" style="background:${l.colour}"></span>${esc(l.name)}</button>`).join("");
   grid.querySelectorAll("[data-line]").forEach((b) => b.onclick = async () => {
-    leg.line = b.dataset.line; leg.from_id = leg.to_id = ""; leg.from_name = leg.to_name = ""; leg._lineStops = null;
+    const changed = leg.line !== b.dataset.line;
+    leg.line = b.dataset.line;
+    if (changed) { leg.from_id = leg.to_id = ""; leg.from_name = leg.to_name = ""; leg._lineStops = null; }
+    leg._lineCollapsed = true;               // auto-collapse the grid after choosing
     renderSetupLegs();
   });
   if (leg.line) await renderTubeStops(host.querySelector("[data-stops]"), leg);
@@ -325,7 +366,7 @@ async function bootHome() {
 el("btn-create").onclick = () => { if (!commute.legs.length) commute.legs.push(newLeg()); renderSetup(); };
 el("btn-edit").onclick = () => renderSetup();
 el("btn-setup-back").onclick = () => bootHome();
-el("btn-add-leg").onclick = () => { commute.legs.push(newLeg()); renderSetupLegs(); };
+el("btn-add-leg").onclick = () => { commute.legs.forEach((l) => { if (legComplete(l)) l._collapsed = true; }); commute.legs.push(newLeg()); renderSetupLegs(); };
 el("btn-save").onclick = () => saveCommute();
 el("btn-delete-all").onclick = async () => { if (!confirm("Delete your whole commute? This can't be undone.")) return; await apiDelete(); commute = { legs: [], alerts: [] }; show("create"); };
 el("btn-leg-back").onclick = () => renderHome();
