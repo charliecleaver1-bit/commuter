@@ -168,8 +168,7 @@ h2 { font-family: var(--display); font-weight: 600; font-size: 20px; letter-spac
 .leg-badge.checking { background: var(--surface-2); color: var(--ink-soft); }
 
 /* countdowns — departure-board style: one emphasised "next" value, the rest as a
-   quiet trailing list, so a card never needs more than one line for times. An optional
-   live-position caption (tube, next arrival only) sits on its own line below. */
+   quiet trailing list, so a card never needs more than one line for times. */
 .times { display: flex; flex-direction: column; gap: 4px; }
 .times-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .time-next {
@@ -181,7 +180,6 @@ h2 { font-family: var(--display); font-weight: 600; font-size: 20px; letter-spac
 .time-next.delay { background: var(--delay); }
 .time-next.bad { background: var(--bad); }
 .time-rest { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); letter-spacing: -.01em; }
-.time-live { font-size: 11px; color: var(--ink-faint); }
 .times-empty { color: var(--ink-faint); font-size: 13px; font-style: italic; }
 
 /* refresh button states */
@@ -190,9 +188,24 @@ h2 { font-family: var(--display); font-weight: 600; font-size: 20px; letter-spac
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* leg detail rows */
-.detail-row { display: flex; align-items: center; gap: 12px; padding: 13px 14px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md); margin-bottom: 8px; box-shadow: var(--shadow-sm); }
+.detail-row { display: flex; flex-direction: column; gap: 4px; padding: 13px 14px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md); margin-bottom: 8px; box-shadow: var(--shadow-sm); }
+.detail-row.clickable { cursor: pointer; }
+.detail-row-top { display: flex; align-items: center; gap: 12px; }
 .detail-time { font-family: var(--mono); font-weight: 700; font-size: 16px; min-width: 62px; }
 .detail-dest { flex: 1; font-size: 14px; color: var(--ink-soft); }
+.detail-live { font-size: 11.5px; color: var(--ink-faint); padding-left: 74px; }
+.detail-expand { margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--line); }
+.svc-stops { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
+.svc-stop { display: flex; align-items: center; gap: 10px; font-size: 12.5px; padding: 3px 0; color: var(--ink-faint); }
+.svc-stop-time { font-family: var(--mono); min-width: 42px; flex: none; }
+.svc-stop-name { flex: 1; }
+.svc-stop.passed { color: var(--ink-soft); }
+.svc-stop.current { color: var(--ink); font-weight: 700; }
+.svc-stop.current .svc-stop-time { color: var(--primary); }
+.svc-inbound { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.detail-alert { font-size: 13px; line-height: 1.5; padding: 11px 13px; border-radius: var(--r-md); margin-bottom: 16px; }
+.detail-alert.bad { background: var(--bad-wash); color: var(--bad); }
+.detail-alert.delay { background: var(--delay-wash); color: var(--delay); }
 
 /* ============================================================
    Setup

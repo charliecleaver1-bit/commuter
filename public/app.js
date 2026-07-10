@@ -204,9 +204,10 @@ function renderRailBody(host, leg) {
   const validate = async () => {
     if (!leg.from_id || !leg.to_id) { vBox.hidden = true; leg._valid = null; return; }
     vBox.hidden = false; vBox.className = "validate checking"; vBox.textContent = "Checking for a direct train…";
-    const ok = await checkDirect(leg.from_id, leg.to_id);
-    leg._valid = ok;
-    if (ok) { vBox.className = "validate ok"; vBox.textContent = "✓ Direct train confirmed"; }
+    const result = await checkDirect(leg.from_id, leg.to_id);
+    leg._valid = result !== "no";
+    if (result === "yes") { vBox.className = "validate ok"; vBox.textContent = "✓ Direct train confirmed"; }
+    else if (result === "unknown") { vBox.className = "validate checking"; vBox.textContent = "Couldn't confirm a direct train right now — you can still save, and it'll check again live."; }
     else { vBox.className = "validate bad"; vBox.innerHTML = "No direct train found. If you change trains, add one leg each — you can still save."; }
   };
   ["from", "to"].forEach((which) => {
@@ -300,25 +301,41 @@ function stationField(label, val, which) {
     </div></div>`;
 }
 
+// Returns "yes" | "no" | "unknown". The previous version only had a boolean, which
+// meant two real bugs collapsed into a false "not direct": (1) the D1 timetable table
+// exists but was never actually populated by an ingest run, so every query came back
+// "empty" and was trusted as proof of no direct train; (2) if the live-board fallback
+// request itself failed (network blip, RDM downtime — the LAST line of defence), that
+// was silently read the same as "checked and found nothing". Both are now surfaced as
+// "unknown" instead, which the UI treats as inconclusive rather than a hard no.
 async function checkDirect(from, to) {
-  // The timetable is authoritative (national, all-day). Sample weekday + Saturday across
-  // several times; if any returns a direct service, it's direct.
-  let timetableWorked = false;
+  let timetableHasData = false;
   try {
     for (const day of ["MO", "SA"]) for (const when of ["07:30", "12:00", "17:30"]) {
       const r = await fetch(`/api/rail/timetable?from=${from}&to=${to}&when=${when}&day=${day}&span=240`);
       if (!r.ok) continue;
-      timetableWorked = true;
       const d = await r.json();
-      if (d.services && d.services.length) return true;
+      if (d.dataAvailable === false) continue; // table not populated — don't trust "empty" from it
+      timetableHasData = true;
+      if (d.services && d.services.length) return "yes";
     }
   } catch (e) {}
-  // If the timetable answered (even if empty), trust it: no direct train.
-  if (timetableWorked) return false;
-  // Only if the timetable was unreachable do we fall back to the live board, and only a
-  // POSITIVE result counts — an empty board is NOT proof of a direct train.
-  try { const r = await fetch(`/api/rail/validate?from=${from}&to=${to}`); const d = await r.json(); if (d.direct === true) return true; } catch (e) {}
-  return false;
+  // The timetable genuinely has data and searched every sampled window without a hit —
+  // trust that as a real "no".
+  if (timetableHasData) return "no";
+
+  // Timetable unavailable — fall back to the live board.
+  try {
+    const r = await fetch(`/api/rail/validate?from=${from}&to=${to}`);
+    if (!r.ok) return "unknown";
+    const d = await r.json();
+    if (d.direct === true) return "yes";
+    // stationHasServices means Darwin found real trains running from `from` right now,
+    // just none calling at `to` — solid evidence either way. If the board had nothing
+    // in view at all (e.g. the middle of the night), that's inconclusive, not a "no".
+    if (d.stationHasServices) return "no";
+    return "unknown";
+  } catch (e) { return "unknown"; }
 }
 
 let boards = {};                // legId -> board data
@@ -537,11 +554,19 @@ function renderTimes(leg, board) {
   const showUnit = !isRail && next.countdown != null && next.countdown > 1;
   const rest = svcs.slice(1).map(fmt);
   const restLabel = rest.length ? rest.join(" · ") + (isRail ? "" : " min") : "";
-  const row = `<div class="times-row"><div class="time-next ${cls}">${esc(nextLabel)}${showUnit ? '<span>min</span>' : ""}</div>${restLabel ? `<div class="time-rest">${esc(restLabel)}</div>` : ""}</div>`;
-  // Live position — tube only, next arrival only, so it's a single quiet caption line
-  // rather than something repeated for every train shown.
-  const live = leg.mode === "tube" && next.currentLocation ? `<div class="time-live">${esc(next.currentLocation)}</div>` : "";
-  return row + live;
+  return `<div class="times-row"><div class="time-next ${cls}">${esc(nextLabel)}${showUnit ? '<span>min</span>' : ""}</div>${restLabel ? `<div class="time-rest">${esc(restLabel)}</div>` : ""}</div>`;
+}
+
+// TfL's disruption reason text can be a full paragraph. The digest at the top is meant
+// to be a quick summary, not the whole notice, so cut it down to roughly one sentence
+// (or a hard character cap if even the first sentence runs long). The full, un-cut text
+// still shows in the leg detail view — this only shortens what's on the home screen.
+function shortReason(reason, maxLen = 70) {
+  if (!reason) return "";
+  const cut = reason.search(/[.!?](\s|$)/);
+  let s = cut > 0 && cut < maxLen ? reason.slice(0, cut + 1) : reason;
+  if (s.length > maxLen) s = s.slice(0, maxLen - 1).trimEnd() + "…";
+  return s;
 }
 
 function renderDigest(legs) {
@@ -554,7 +579,7 @@ function renderDigest(legs) {
     host.innerHTML = `<div class="summary good"><span class="dot"></span><div class="summary-lines"><span class="summary-head">${direction === "pm" ? "Your way home looks clear" : "Your commute looks clear"}</span><span class="summary-sub">Good service on all ${legs.length} leg${legs.length > 1 ? "s" : ""}</span></div></div>`;
     return;
   }
-  const lines = issues.map((x) => `<span class="summary-sub">${esc(titleFor(x.leg))} — ${esc(x.st.label)}${x.st.reason ? ": " + esc(x.st.reason) : ""}</span>`).join("");
+  const lines = issues.map((x) => `<span class="summary-sub">${esc(titleFor(x.leg))} — ${esc(x.st.label)}${x.st.reason ? ": " + esc(shortReason(x.st.reason)) : ""}</span>`).join("");
   host.innerHTML = `<div class="summary bad"><span class="dot"></span><div class="summary-lines"><span class="summary-head">${issues.length} issue${issues.length > 1 ? "s" : ""} on your ${direction === "pm" ? "way home" : "commute"}</span>${lines}</div></div>`;
 }
 
@@ -695,18 +720,75 @@ function openLegDetail(leg) {
   el("leg-detail-mode").textContent = MODE_LABEL[leg.mode] + " · " + titleFor(leg);
   const board = boards[leg.id] || { services: [] };
   const svcs = board.services || [];
+  const st = legStatus(leg, board);
+  const isRail = leg.mode === "rail";
+  // Full disruption text lives here rather than on the home card — the home screen
+  // just gets the short badge + one-line digest summary.
+  const disruptionBlock = leg.mode === "tube" && st.reason
+    ? `<div class="detail-alert ${st.badge === "bad" ? "bad" : "delay"}">${esc(st.reason)}</div>`
+    : "";
   const crowdLine = leg.mode === "tube" && board.crowding != null
     ? `<p class="hint" style="margin-bottom:18px">Station busyness: ${board.crowding}% of its typical peak right now</p>`
     : "";
   el("leg-detail-body").innerHTML = `
     <h2 style="margin-bottom:4px">${esc(leg.from_name)} → ${esc(leg.to_name)}</h2>
     <p class="hint" style="margin-bottom:18px">${esc(titleFor(leg))}</p>
+    ${disruptionBlock}
     ${crowdLine}
     ${svcs.length ? svcs.map((s) => {
-      const big = leg.mode === "rail" ? (s.std || s.estimated || "") : (s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown + " min") : "");
-      return `<div class="detail-row"><span class="detail-time">${esc(big)}</span><span class="detail-dest">${esc(s.destination || "")}</span><span class="leg-badge ${s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "good"}">${esc(s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? "exp " + s.estimated : "Delayed") : (s.platform ? "Pl " + s.platform : "On time"))}</span></div>`;
-    }).join("") : '<p class="hint">No live services right now.</p>'}
-    ${leg.mode === "rail" ? '<p class="hint" style="margin-top:16px">Full live detail — position, formed-by, fastest train — coming next.</p>' : ""}`;
+      const big = isRail ? (s.std || s.estimated || "") : (s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown + " min") : "");
+      const live = leg.mode === "tube" && s.currentLocation ? `<div class="detail-live">${esc(s.currentLocation)}</div>` : "";
+      const svcId = isRail ? (s.serviceID || "") : "";
+      return `<div class="detail-row${svcId ? " clickable" : ""}" ${svcId ? `data-svc-id="${esc(svcId)}"` : ""}>
+        <div class="detail-row-top"><span class="detail-time">${esc(big)}</span><span class="detail-dest">${esc(s.destination || "")}</span><span class="leg-badge ${s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "good"}">${esc(s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? "exp " + s.estimated : "Delayed") : (s.platform ? "Pl " + s.platform : "On time"))}</span></div>
+        ${live}
+        ${svcId ? '<div class="detail-expand" data-expand hidden></div>' : ""}
+      </div>`;
+    }).join("") : '<p class="hint">No live services right now.</p>'}`;
+
+  if (isRail) {
+    el("leg-detail-body").querySelectorAll(".detail-row[data-svc-id]").forEach((row) => {
+      row.onclick = (e) => { if (!e.target.closest(".detail-expand")) toggleServiceDetail(row); };
+    });
+  }
+}
+
+// Tap a rail service row to load and show its full calling-point progress — live
+// position (which stops it's already called at) and, where we can work it out, the
+// earlier working that likely forms it. Lazy: nothing is fetched until you tap.
+async function toggleServiceDetail(row) {
+  const panel = row.querySelector("[data-expand]");
+  if (!panel) return;
+  if (!panel.hidden) { panel.hidden = true; return; }
+  row.parentElement.querySelectorAll(".detail-expand:not([hidden])").forEach((p) => { if (p !== panel) p.hidden = true; });
+  panel.hidden = false;
+  if (panel.dataset.loaded) return;
+  panel.innerHTML = '<p class="hint" style="padding:6px 0">Loading live position…</p>';
+  try {
+    const r = await fetch(`/api/rail/service?id=${encodeURIComponent(row.dataset.svcId)}`);
+    const d = await r.json();
+    if (!r.ok || d.error) { panel.innerHTML = '<p class="hint" style="padding:6px 0">Couldn\'t load live position right now.</p>'; return; }
+    panel.innerHTML = renderServicePanel(d);
+    panel.dataset.loaded = "1";
+  } catch (e) {
+    panel.innerHTML = '<p class="hint" style="padding:6px 0">Couldn\'t load live position right now.</p>';
+  }
+}
+
+function renderServicePanel(d) {
+  const stopsHtml = (d.stops || []).map((s) => {
+    const cls = s.current ? "current" : s.passed ? "passed" : "";
+    const time = s.atd || s.etd || s.std || "";
+    return `<div class="svc-stop ${cls}"><span class="svc-stop-time">${esc(time)}</span><span class="svc-stop-name">${esc(s.name)}</span>${s.cancelled ? '<span class="leg-badge bad">Cancelled</span>' : ""}</div>`;
+  }).join("");
+  // "Formed by" is a best-effort platform/timing guess when it isn't a confirmed link
+  // (see functions/api/rail/service.js) — worded as "likely" rather than stated as fact.
+  const inbound = d.inbound
+    ? `<div class="svc-inbound"><p class="hint" style="margin-bottom:0">Formed by the ${esc(d.inbound.origin)} → ${esc(d.inbound.destination)} working${d.inbound.inferred ? " (likely)" : ""}${d.inbound.platform ? `, due platform ${esc(d.inbound.platform)}` : ""}${d.inbound.expectedArr ? `, expected ${esc(d.inbound.expectedArr)}` : ""}</p></div>`
+    : "";
+  return `<p class="hint" style="margin:2px 0 8px;font-weight:600;color:var(--ink)">${esc(d.caption || "")}</p>
+    <div class="svc-stops">${stopsHtml}</div>
+    ${inbound}`;
 }
 
 async function bootHome() {
