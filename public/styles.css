@@ -157,6 +157,9 @@ h2 { font-family: var(--display); font-weight: 600; font-size: 20px; letter-spac
 .leg-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
 .leg-line-name { display: flex; align-items: center; gap: 7px; font-family: var(--display); font-weight: 650; font-size: 15.5px; }
 .leg-swatch { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+.step-badge { font-size: 12px; line-height: 1; margin-left: -2px; }
+.step-badge.yes { color: var(--good); }
+.step-badge.no { color: var(--ink-faint); }
 .leg-route { color: var(--ink-soft); font-size: 13px; margin-bottom: 10px; }
 .leg-badge { font-size: 11.5px; font-weight: 700; padding: 3px 9px; border-radius: 20px; white-space: nowrap; letter-spacing: .01em; }
 .leg-badge.good { background: var(--good-wash); color: var(--good); }
@@ -165,8 +168,10 @@ h2 { font-family: var(--display); font-weight: 600; font-size: 20px; letter-spac
 .leg-badge.checking { background: var(--surface-2); color: var(--ink-soft); }
 
 /* countdowns — departure-board style: one emphasised "next" value, the rest as a
-   quiet trailing list, so a card never needs more than one line for times. */
-.times { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+   quiet trailing list, so a card never needs more than one line for times. An optional
+   live-position caption (tube, next arrival only) sits on its own line below. */
+.times { display: flex; flex-direction: column; gap: 4px; }
+.times-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .time-next {
   font-family: var(--mono); background: var(--ink); color: #fff; font-weight: 700;
   font-size: 19px; letter-spacing: -.02em; line-height: 1; padding: 7px 12px;
@@ -176,6 +181,7 @@ h2 { font-family: var(--display); font-weight: 600; font-size: 20px; letter-spac
 .time-next.delay { background: var(--delay); }
 .time-next.bad { background: var(--bad); }
 .time-rest { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); letter-spacing: -.01em; }
+.time-live { font-size: 11px; color: var(--ink-faint); }
 .times-empty { color: var(--ink-faint); font-size: 13px; font-style: italic; }
 
 /* refresh button states */

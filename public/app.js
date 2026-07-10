@@ -323,30 +323,39 @@ async function checkDirect(from, to) {
 
 let boards = {};                // legId -> board data
 
-// Direction (inbound/outbound + onward station names) depends only on line+from+to,
-// which never changes for a saved leg — so resolve it once, at save time, for both
-// the AM and PM direction, and store it on the leg. Nothing at runtime ever calls
-// /api/tube/direction; fetchBoard just reads what's already there. This is the lean
-// version: no cache, no dedupe, no live fallback — one lookup per direction per leg,
-// exactly once, when you hit Save.
+// Direction (inbound/outbound + onward stations) and step-free accessibility both
+// depend only on line+from+to, which never change for a saved leg — so resolve them
+// once, at save time, and store on the leg. Nothing at runtime calls /api/tube/direction
+// or /api/tube/accessibility; fetchBoard and the card just read what's already there.
 function fetchDirection(line, from, to) {
   return fetch(`/api/tube/direction?line=${encodeURIComponent(line)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`)
-    .then((r) => (r.ok ? r.json() : { direction: null, onward: [] }))
-    .catch(() => ({ direction: null, onward: [] }));
+    .then((r) => (r.ok ? r.json() : { direction: null, onward: [], onwardIds: [] }))
+    .catch(() => ({ direction: null, onward: [], onwardIds: [] }));
+}
+function fetchAccessibility(stop) {
+  return fetch(`/api/tube/accessibility?stop=${encodeURIComponent(stop)}`)
+    .then((r) => (r.ok ? r.json() : { stepFree: null }))
+    .catch(() => ({ stepFree: null }));
 }
 async function resolveTubeDirections(legs) {
   await Promise.all(legs.filter((l) => l.mode === "tube" && l.line && l.from_id && l.to_id).map(async (leg) => {
-    const [fwd, rev] = await Promise.all([
+    const [fwd, rev, accFrom, accTo] = await Promise.all([
       fetchDirection(leg.line, leg.from_id, leg.to_id),
       fetchDirection(leg.line, leg.to_id, leg.from_id),
+      fetchAccessibility(leg.from_id),
+      fetchAccessibility(leg.to_id),
     ]);
     leg.tubeDir = fwd.direction || null;
     leg.tubeOnward = fwd.onward || [];
+    leg.tubeOnwardIds = fwd.onwardIds || [];
     leg.tubeDirRev = rev.direction || null;
     leg.tubeOnwardRev = rev.onward || [];
-    // Temporary diagnostic — check the browser console after saving to see exactly
-    // what TfL's Route/Sequence lookup returned for this leg.
-    console.log("[commuter] resolved direction for leg", leg.id, { line: leg.line, from: leg.from_id, to: leg.to_id, fwd, rev });
+    leg.tubeOnwardIdsRev = rev.onwardIds || [];
+    // Step-free only if BOTH ends are confirmed step-free; false if either end is
+    // confirmed not; null (shown as no icon) if either end couldn't be determined.
+    leg.stepFree = (accFrom.stepFree === true && accTo.stepFree === true) ? true
+      : (accFrom.stepFree === false || accTo.stepFree === false) ? false
+      : null;
   }));
 }
 
@@ -390,8 +399,9 @@ function reverseLeg(leg) {
     from_name: leg.to_name, to_name: leg.from_name,
     _reversed: true,
     // Tube: swap in the direction/onward pair resolved for this direction at save
-    // time — no lookup here, ever.
-    tubeDir: leg.tubeDirRev, tubeOnward: leg.tubeOnwardRev,
+    // time — no lookup here, ever. stepFree isn't direction-specific so it carries
+    // over automatically via the ...leg spread above.
+    tubeDir: leg.tubeDirRev, tubeOnward: leg.tubeOnwardRev, tubeOnwardIds: leg.tubeOnwardIdsRev,
     // bus: opposite-direction stops resolved lazily; keep route + flip dir token
     direction: leg.direction === "inbound" ? "outbound" : leg.direction === "outbound" ? "inbound" : leg.direction,
   };
@@ -441,11 +451,14 @@ function renderHome() {
 function legSkeleton(leg, i, total) {
   const isLast = i === total - 1;
   const col = colourFor(leg);
+  const stepIcon = leg.mode === "tube" && leg.stepFree != null
+    ? `<span class="step-badge ${leg.stepFree ? "yes" : "no"}" title="${leg.stepFree ? "Step-free access at both ends" : "Not step-free at one or both ends"}">♿</span>`
+    : "";
   return `<div class="leg" style="--segCol:${col};--nodeCol:${col};transition-delay:${i * 60}ms">
     <div class="leg-spine"><div class="leg-node">${MODE_ICON[leg.mode]}</div>${isLast ? "" : '<div class="leg-connector"></div>'}</div>
     <button class="leg-card" data-leg="${leg.id}" style="--segCol:${col}">
       <div class="leg-top">
-        <div class="leg-line-name"><span class="leg-swatch" style="background:${col}"></span>${esc(titleFor(leg))}</div>
+        <div class="leg-line-name"><span class="leg-swatch" style="background:${col}"></span>${esc(titleFor(leg))}${stepIcon}</div>
         <span class="leg-badge checking" data-badge>…</span>
       </div>
       <div class="leg-route">${esc(leg.from_name)} → ${esc(leg.to_name)}</div>
@@ -479,8 +492,21 @@ function legStatus(leg, board) {
     // good/bad/delay summary — the specific reason (signal failure, etc.) only shows
     // in the top digest, via the `reason` field below.
     const sev = board.lineStatusLevel;
-    if (sev != null && sev < 6) return { card: "problem", badge: "bad", label: "Bad service", reason: board.lineReason };
-    if (sev != null && sev < 10) return { card: "problem-amber", badge: "delay", label: "Minor delay", reason: board.lineReason };
+    if (sev != null && sev < 10) {
+      // Best-effort branch check: if TfL told us exactly which stops the disruption's
+      // affected route section covers, and none of them are on this leg's actual path
+      // (boarding stop, alighting stop, or anything onward between them), it's a
+      // different branch of the same line — don't flag it here. If TfL didn't give us
+      // that structured detail (disruptionStopIds is null), we can't tell, so we fall
+      // through to flagging it as today, rather than risk hiding a real problem.
+      if (board.disruptionStopIds?.length) {
+        const mine = new Set([leg.from_id, leg.to_id, ...(leg.tubeOnwardIds || [])]);
+        const affectsMe = board.disruptionStopIds.some((id) => mine.has(id));
+        if (!affectsMe) return { card: "", badge: "good", label: "Good service", reason: null };
+      }
+      if (sev < 6) return { card: "problem", badge: "bad", label: "Bad service", reason: board.lineReason };
+      return { card: "problem-amber", badge: "delay", label: "Minor delay", reason: board.lineReason };
+    }
     return { card: "", badge: "good", label: "Good service", reason: null };
   }
   if (leg.mode === "bus") {
@@ -511,7 +537,11 @@ function renderTimes(leg, board) {
   const showUnit = !isRail && next.countdown != null && next.countdown > 1;
   const rest = svcs.slice(1).map(fmt);
   const restLabel = rest.length ? rest.join(" · ") + (isRail ? "" : " min") : "";
-  return `<div class="time-next ${cls}">${esc(nextLabel)}${showUnit ? '<span>min</span>' : ""}</div>${restLabel ? `<div class="time-rest">${esc(restLabel)}</div>` : ""}`;
+  const row = `<div class="times-row"><div class="time-next ${cls}">${esc(nextLabel)}${showUnit ? '<span>min</span>' : ""}</div>${restLabel ? `<div class="time-rest">${esc(restLabel)}</div>` : ""}</div>`;
+  // Live position — tube only, next arrival only, so it's a single quiet caption line
+  // rather than something repeated for every train shown.
+  const live = leg.mode === "tube" && next.currentLocation ? `<div class="time-live">${esc(next.currentLocation)}</div>` : "";
+  return row + live;
 }
 
 function renderDigest(legs) {
@@ -578,6 +608,9 @@ async function fetchBoard(leg, signal) {
     // `direction` on every arrival.
     let url = `/api/tube/board?stop=${encodeURIComponent(leg.from_id)}&line=${encodeURIComponent(leg.line)}`;
     if (leg.tubeDir) url += `&direction=${leg.tubeDir}`;
+    // Crowding changes live, unlike direction, so it's fetched here rather than at
+    // save time — but run alongside the board request rather than after it.
+    const crowdPromise = fetch(`/api/tube/crowding?stop=${encodeURIComponent(leg.from_id)}`, { signal }).catch(() => null);
     const r = await fetch(url, { signal });
     if (!r.ok) return { services: [], _error: await describeFailure(r) };
     const board = await r.json();
@@ -586,6 +619,10 @@ async function fetchBoard(leg, signal) {
       const filt = board.services.filter((s) => s.destination && onward.has(s.destination.toLowerCase().replace(/ underground station$/, "").replace(/ station$/, "")));
       if (filt.length) board.services = filt;
     }
+    try {
+      const cr = await crowdPromise;
+      board.crowding = (cr && cr.ok) ? (await cr.json()).percentage : null;
+    } catch (e) { board.crowding = null; }
     return board;
   }
   if (leg.mode === "bus") {
@@ -658,13 +695,13 @@ function openLegDetail(leg) {
   el("leg-detail-mode").textContent = MODE_LABEL[leg.mode] + " · " + titleFor(leg);
   const board = boards[leg.id] || { services: [] };
   const svcs = board.services || [];
-  const debugLine = leg.mode === "tube"
-    ? `<p class="hint" style="margin-bottom:18px">Direction: ${esc(leg.tubeDir || "not resolved")} · Onward: ${leg.tubeOnward?.length ? esc(leg.tubeOnward.join(", ")) : "none"} · Sample destinations seen: ${esc([...new Set(svcs.map((s) => s.destination).filter(Boolean))].join(", ") || "none")}</p>`
+  const crowdLine = leg.mode === "tube" && board.crowding != null
+    ? `<p class="hint" style="margin-bottom:18px">Station busyness: ${board.crowding}% of its typical peak right now</p>`
     : "";
   el("leg-detail-body").innerHTML = `
     <h2 style="margin-bottom:4px">${esc(leg.from_name)} → ${esc(leg.to_name)}</h2>
     <p class="hint" style="margin-bottom:18px">${esc(titleFor(leg))}</p>
-    ${debugLine}
+    ${crowdLine}
     ${svcs.length ? svcs.map((s) => {
       const big = leg.mode === "rail" ? (s.std || s.estimated || "") : (s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown + " min") : "");
       return `<div class="detail-row"><span class="detail-time">${esc(big)}</span><span class="detail-dest">${esc(s.destination || "")}</span><span class="leg-badge ${s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "good"}">${esc(s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? "exp " + s.estimated : "Delayed") : (s.platform ? "Pl " + s.platform : "On time"))}</span></div>`;
@@ -679,7 +716,7 @@ async function bootHome() {
     // One-off backfill for legs saved before direction persistence existed (e.g. your
     // current commute). Only runs for legs actually missing it, and only once ever —
     // after this, they're saved with it and this does nothing on future boots.
-    const legacy = commute.legs.filter((l) => l.mode === "tube" && l.line && l.from_id && l.to_id && l.tubeDir === undefined);
+    const legacy = commute.legs.filter((l) => l.mode === "tube" && l.line && l.from_id && l.to_id && (l.tubeDir === undefined || l.stepFree === undefined));
     if (legacy.length) { await resolveTubeDirections(legacy); await apiSave(commute); }
     direction = autoDirection();
     renderHome();

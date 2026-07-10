@@ -81,10 +81,18 @@ export async function onRequest(context) {
     arrivals = arrivals.slice(0, rows);
 
     // 2) Line status → a human disruption reason if the line isn't in Good Service.
+    //    Also try to pull the specific stop ids the disruption's affected route section
+    //    covers (TfL's disruption.affectedRoutes[].routeSectionNaptanEntrySequence), so
+    //    the frontend can tell "affects your branch" apart from "affects a different
+    //    branch of this line entirely". This is best-effort: TfL doesn't always populate
+    //    that structured data for every disruption. When it's absent, disruptionStopIds
+    //    comes back null and the frontend falls back to today's behaviour (treat any
+    //    disruption on the line as relevant) rather than risk hiding a real problem.
     let disruptionReason = null;
     let severity = "on_time";
     let lineStatusDesc = "Good Service";
     let lineStatusLevel = 10;
+    let disruptionStopIds = null;
     const status = await statusPromise;
     if (status) {
       const ls = status?.[0]?.lineStatuses?.[0];
@@ -94,6 +102,9 @@ export async function onRequest(context) {
         if (ls.statusSeverity !== 10) {
           disruptionReason = ls.reason || ls.statusSeverityDescription || null;
           severity = "delayed";
+          const sections = ls.disruption?.affectedRoutes || [];
+          const ids = sections.flatMap((sec) => (sec.routeSectionNaptanEntrySequence || []).map((e) => e.stopPoint?.id).filter(Boolean));
+          if (ids.length) disruptionStopIds = [...new Set(ids)];
         }
       }
     }
@@ -116,6 +127,7 @@ export async function onRequest(context) {
         lineId: a.lineId || null,
         lineName: a.lineName || null,
         direction: a.direction || null,
+        currentLocation: a.currentLocation || null,   // e.g. "At Mile End" / "Between X and Y"
       };
     });
 
@@ -130,6 +142,7 @@ export async function onRequest(context) {
         lineStatus: lineStatusDesc,
         lineStatusLevel,
         lineReason: disruptionReason,
+        disruptionStopIds,
         services,
       },
       200,
