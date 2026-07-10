@@ -323,6 +323,33 @@ async function checkDirect(from, to) {
 
 let boards = {};                // legId -> board data
 
+// Direction (inbound/outbound + onward station names) depends only on line+from+to,
+// which never changes for a saved leg — so resolve it once, at save time, for both
+// the AM and PM direction, and store it on the leg. Nothing at runtime ever calls
+// /api/tube/direction; fetchBoard just reads what's already there. This is the lean
+// version: no cache, no dedupe, no live fallback — one lookup per direction per leg,
+// exactly once, when you hit Save.
+function fetchDirection(line, from, to) {
+  return fetch(`/api/tube/direction?line=${encodeURIComponent(line)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`)
+    .then((r) => (r.ok ? r.json() : { direction: null, onward: [] }))
+    .catch(() => ({ direction: null, onward: [] }));
+}
+async function resolveTubeDirections(legs) {
+  await Promise.all(legs.filter((l) => l.mode === "tube" && l.line && l.from_id && l.to_id).map(async (leg) => {
+    const [fwd, rev] = await Promise.all([
+      fetchDirection(leg.line, leg.from_id, leg.to_id),
+      fetchDirection(leg.line, leg.to_id, leg.from_id),
+    ]);
+    leg.tubeDir = fwd.direction || null;
+    leg.tubeOnward = fwd.onward || [];
+    leg.tubeDirRev = rev.direction || null;
+    leg.tubeOnwardRev = rev.onward || [];
+    // Temporary diagnostic — check the browser console after saving to see exactly
+    // what TfL's Route/Sequence lookup returned for this leg.
+    console.log("[commuter] resolved direction for leg", leg.id, { line: leg.line, from: leg.from_id, to: leg.to_id, fwd, rev });
+  }));
+}
+
 /* ---- save ---- */
 async function saveCommute() {
   const incomplete = commute.legs.filter((l) => !l.from_id || !l.to_id || (l.mode === "tube" && !l.line));
@@ -341,6 +368,7 @@ async function saveCommute() {
     // strip transient fields before saving
     delete leg._routeDirs; delete leg._lineStops; delete leg._collapsed; delete leg._lineCollapsed;
   }
+  await resolveTubeDirections(commute.legs);   // one-off pull, persisted below — never looked up live again
   await apiSave(commute);
   await bootHome();
 }
@@ -361,6 +389,9 @@ function reverseLeg(leg) {
     from_id: leg.to_id, to_id: leg.from_id,
     from_name: leg.to_name, to_name: leg.from_name,
     _reversed: true,
+    // Tube: swap in the direction/onward pair resolved for this direction at save
+    // time — no lookup here, ever.
+    tubeDir: leg.tubeDirRev, tubeOnward: leg.tubeOnwardRev,
     // bus: opposite-direction stops resolved lazily; keep route + flip dir token
     direction: leg.direction === "inbound" ? "outbound" : leg.direction === "outbound" ? "inbound" : leg.direction,
   };
@@ -540,11 +571,22 @@ async function describeFailure(r) {
 
 async function fetchBoard(leg, signal) {
   if (leg.mode === "tube") {
-    // Direction filtering removed for now — this shows all arrivals on the line at
-    // this stop, both directions, unfiltered. Being revisited later.
-    const r = await fetch(`/api/tube/board?stop=${encodeURIComponent(leg.from_id)}&line=${encodeURIComponent(leg.line)}`, { signal });
+    // Direction was resolved once at save time and is stored on the leg (tubeDir/
+    // tubeOnward) — no lookup happens here. Pass it to board.js so TfL's own
+    // `direction` field filters server-side; fall back to matching destination names
+    // against the resolved "onward" list client-side, since TfL doesn't always set
+    // `direction` on every arrival.
+    let url = `/api/tube/board?stop=${encodeURIComponent(leg.from_id)}&line=${encodeURIComponent(leg.line)}`;
+    if (leg.tubeDir) url += `&direction=${leg.tubeDir}`;
+    const r = await fetch(url, { signal });
     if (!r.ok) return { services: [], _error: await describeFailure(r) };
-    return await r.json();
+    const board = await r.json();
+    if (leg.tubeOnward?.length && board.services?.length && !board.services.some((s) => s.direction)) {
+      const onward = new Set(leg.tubeOnward.map((n) => n.toLowerCase()));
+      const filt = board.services.filter((s) => s.destination && onward.has(s.destination.toLowerCase().replace(/ underground station$/, "").replace(/ station$/, "")));
+      if (filt.length) board.services = filt;
+    }
+    return board;
   }
   if (leg.mode === "bus") {
     const stop = leg._reversed ? (leg.rev_from_id || leg.from_id) : leg.from_id;
@@ -616,9 +658,13 @@ function openLegDetail(leg) {
   el("leg-detail-mode").textContent = MODE_LABEL[leg.mode] + " · " + titleFor(leg);
   const board = boards[leg.id] || { services: [] };
   const svcs = board.services || [];
+  const debugLine = leg.mode === "tube"
+    ? `<p class="hint" style="margin-bottom:18px">Direction: ${esc(leg.tubeDir || "not resolved")} · Onward: ${leg.tubeOnward?.length ? esc(leg.tubeOnward.join(", ")) : "none"} · Sample destinations seen: ${esc([...new Set(svcs.map((s) => s.destination).filter(Boolean))].join(", ") || "none")}</p>`
+    : "";
   el("leg-detail-body").innerHTML = `
     <h2 style="margin-bottom:4px">${esc(leg.from_name)} → ${esc(leg.to_name)}</h2>
     <p class="hint" style="margin-bottom:18px">${esc(titleFor(leg))}</p>
+    ${debugLine}
     ${svcs.length ? svcs.map((s) => {
       const big = leg.mode === "rail" ? (s.std || s.estimated || "") : (s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown + " min") : "");
       return `<div class="detail-row"><span class="detail-time">${esc(big)}</span><span class="detail-dest">${esc(s.destination || "")}</span><span class="leg-badge ${s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "good"}">${esc(s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? "exp " + s.estimated : "Delayed") : (s.platform ? "Pl " + s.platform : "On time"))}</span></div>`;
@@ -630,6 +676,11 @@ async function bootHome() {
   const saved = await apiGet();
   if (saved && saved.legs && saved.legs.length) {
     commute = saved; await loadTubeLines();
+    // One-off backfill for legs saved before direction persistence existed (e.g. your
+    // current commute). Only runs for legs actually missing it, and only once ever —
+    // after this, they're saved with it and this does nothing on future boots.
+    const legacy = commute.legs.filter((l) => l.mode === "tube" && l.line && l.from_id && l.to_id && l.tubeDir === undefined);
+    if (legacy.length) { await resolveTubeDirections(legacy); await apiSave(commute); }
     direction = autoDirection();
     renderHome();
     loadBoards();
