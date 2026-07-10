@@ -195,30 +195,59 @@ h2 { font-family: var(--display); font-weight: 600; font-size: 20px; letter-spac
 .detail-chevron.open { transform: rotate(90deg); color: var(--ink-soft); }
 .detail-time { font-family: var(--mono); font-weight: 700; font-size: 16px; min-width: 62px; }
 .detail-dest { flex: 1; font-size: 14px; color: var(--ink-soft); }
-.detail-live { font-size: 11.5px; color: var(--ink-faint); padding-left: 74px; }
-.detail-expand { margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--line); }
-.svc-stops { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
-.svc-header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 3px; }
-.svc-route { font-family: var(--display); font-weight: 650; font-size: 14px; }
-.svc-operator { font-size: 11.5px; color: var(--ink-faint); }
-.svc-caption { font-size: 12.5px; font-weight: 600; color: var(--ink); margin: 0 0 8px; }
-.svc-stop { display: flex; align-items: center; gap: 10px; font-size: 12.5px; padding: 3px 0; color: var(--ink-faint); }
-.svc-stop-time { font-family: var(--mono); min-width: 42px; flex: none; }
-.svc-stop-name { flex: 1; }
-.svc-stop-plat { font-size: 10.5px; color: var(--ink-faint); }
-.svc-stop.passed { color: var(--ink-soft); }
-.svc-stop.current { color: var(--ink); font-weight: 700; }
-.svc-stop.current .svc-stop-time { color: var(--primary); }
-.svc-inbound { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
-.svc-inbound-toggle { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; background: none; border: none; padding: 0; font: inherit; text-align: left; cursor: pointer; }
-.svc-inbound-label { font-size: 12px; color: var(--ink-soft); line-height: 1.4; }
-.svc-inbound-toggle .detail-chevron { width: 14px; height: 14px; }
-.svc-inbound.open .detail-chevron { transform: rotate(90deg); }
-.svc-inbound-body { display: none; margin-top: 8px; }
-.svc-inbound.open .svc-inbound-body { display: block; }
+.detail-expand { margin-top: 6px; padding-top: 12px; border-top: 1px solid var(--line); }
 .detail-alert { font-size: 13px; line-height: 1.5; padding: 11px 13px; border-radius: var(--r-md); margin-bottom: 16px; }
 .detail-alert.bad { background: var(--bad-wash); color: var(--bad); }
 .detail-alert.delay { background: var(--delay-wash); color: var(--delay); }
+
+/* expanded service panel — header block */
+.svc-live-tag { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; letter-spacing: .08em; color: var(--ink-faint); text-transform: uppercase; margin-bottom: 6px; }
+.svc-live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+.svc-dest { font-family: var(--display); font-weight: 700; font-size: 21px; letter-spacing: -.01em; line-height: 1.15; }
+.svc-calls { font-size: 13px; color: var(--ink-soft); margin: 2px 0 14px; }
+.svc-departs-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.svc-departs-label { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; color: var(--ink-faint); text-transform: uppercase; margin-bottom: 2px; }
+.svc-departs-time { font-family: var(--mono); font-weight: 700; font-size: 26px; letter-spacing: -.02em; color: var(--primary); line-height: 1; }
+.svc-status-line { font-size: 12.5px; margin-top: 4px; }
+.svc-status-line.good { color: var(--good); }
+.svc-status-line.delay { color: var(--delay); }
+.svc-status-line.bad { color: var(--bad); }
+.svc-countdown { text-align: right; flex: none; }
+.svc-countdown-num { font-family: var(--mono); font-weight: 700; font-size: 26px; letter-spacing: -.02em; line-height: 1; }
+.svc-countdown-num span { font-size: 13px; font-weight: 600; }
+.svc-countdown-label { display: block; font-size: 9.5px; font-weight: 700; letter-spacing: .08em; color: var(--ink-faint); margin-top: 2px; }
+.svc-platform-row { font-size: 12.5px; color: var(--ink-soft); margin-bottom: 4px; }
+.svc-plat-pill { display: inline-block; background: var(--surface-2); border-radius: 5px; padding: 1px 7px; font-weight: 700; color: var(--ink); font-family: var(--mono); font-size: 12px; }
+.svc-divider { height: 1px; background: var(--line); margin: 12px 0; }
+.svc-caption { font-size: 12.5px; font-weight: 600; color: var(--ink); margin: 0 0 12px; }
+
+/* horizontal live-position timeline */
+.htl-wrap { overflow-x: auto; margin: 0 -14px 4px; padding: 2px 14px 6px; -webkit-overflow-scrolling: touch; }
+.htl-track { position: relative; }
+.htl-line { position: absolute; top: 27px; height: 2px; background: var(--line); }
+.htl-fill { position: absolute; top: 27px; height: 2px; background: var(--good); transition: width .3s; }
+.htl-cols { display: flex; position: relative; }
+.htl-col { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 6px; flex: none; }
+.htl-time { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+.htl-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--surface); border: 2px solid var(--ink-faint); }
+.htl-name { font-size: 11px; color: var(--ink-faint); line-height: 1.25; max-width: 74px; }
+.htl-plat { font-size: 9.5px; color: var(--ink-faint); }
+.htl-col.passed .htl-dot { background: var(--good); border-color: var(--good); }
+.htl-col.passed .htl-name, .htl-col.passed .htl-time { color: var(--ink-soft); }
+.htl-col.current .htl-dot { width: 16px; height: 16px; background: var(--ink); border-color: var(--ink); box-shadow: 0 0 0 5px var(--good-wash); }
+.htl-col.current .htl-name { color: var(--ink); font-weight: 700; }
+.htl-col.current .htl-time { color: var(--ink); font-weight: 700; }
+
+/* formed-by */
+.svc-inbound { margin-top: 4px; }
+.svc-inbound-note { font-size: 12px; color: var(--ink-faint); margin-top: 4px; }
+.svc-inbound-toggle { display: flex; align-items: center; gap: 8px; width: 100%; background: none; border: none; padding: 0; font: inherit; text-align: left; cursor: pointer; }
+.svc-inbound-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); flex: none; }
+.svc-inbound-label { flex: 1; font-size: 12.5px; color: var(--ink-soft); line-height: 1.4; }
+.svc-inbound-toggle .detail-chevron { width: 14px; height: 14px; }
+.svc-inbound.open .svc-inbound-toggle .detail-chevron { transform: rotate(90deg); }
+.svc-inbound-body { display: none; margin-top: 10px; }
+.svc-inbound.open .svc-inbound-body { display: block; }
 
 /* ============================================================
    Setup

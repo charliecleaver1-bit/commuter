@@ -81,7 +81,13 @@ export async function onRequest(context) {
   try {
     const inbound = await inferInbound(env, svc);
     if (inbound) result.inbound = inbound;
-  } catch (e) { /* bonus feature — omit rather than fail the whole request */ }
+    else result._inboundNote = "No inbound working could be inferred (needs a platform + a same-platform arrival within a plausible turnaround window).";
+  } catch (e) {
+    // Surfaced (not swallowed) so "why is Formed By missing" is answerable — most
+    // likely cause is DARWIN_ARRIVALS_PRODUCT/DARWIN_ARRIVALS_APIKEY not set yet,
+    // same pattern as the GetServiceDetails routing fix.
+    result._inboundNote = `Formed-by lookup failed: ${e.message || e}`;
+  }
 
   return json(result, 200, { "Cache-Control": "public, max-age=20" });
 }
@@ -130,19 +136,23 @@ function buildProgress(svc) {
 
   // Fractional position between "last departed" and "next stop", ported from
   // maldenTrains' computePosition — interpolates using elapsed time vs the scheduled
-  // gap between the two, so the caption can say "left X, approaching Y" instead of a
-  // flat "departed/next" with no sense of how far along it is.
+  // gap between the two. `pos` is a continuous index (e.g. 2.4 = 40% of the way from
+  // stop 2 to stop 3) the frontend uses to place the timeline marker precisely, not
+  // just snap it to a stop.
   let caption = "No live information.";
+  let pos = 0;
   if (stops.length) {
     if (lastDeparted < 0) {
       caption = `Not yet departed ${stops[0].name}`;
+      pos = 0;
     } else if (lastDeparted >= stops.length - 1) {
       caption = `Arrived at ${stops[stops.length - 1].name}`;
+      pos = stops.length - 1;
     } else {
       const from = stops[lastDeparted], to = stops[currentIdx];
       const depMin = timeToMinutesToday(from.atd || from.etd || from.std);
       const arrMin = timeToMinutesToday(to.etd || to.std);
-      let frac = null;
+      let frac = 0;
       if (depMin != null && arrMin != null) {
         const span = arrMin - depMin;
         if (span > 0) {
@@ -150,7 +160,8 @@ function buildProgress(svc) {
           frac = Math.max(0, Math.min(1, (nowMin - depMin) / span));
         }
       }
-      caption = frac != null && frac > 0.08 && frac < 0.92
+      pos = lastDeparted + frac;
+      caption = frac > 0.08 && frac < 0.92
         ? `Left ${from.name}, approaching ${to.name}`
         : `Departed ${from.name}, next ${to.name}`;
     }
@@ -162,6 +173,7 @@ function buildProgress(svc) {
     operator: svc.operator || "",
     stops,
     caption,
+    pos,
   };
 }
 
@@ -173,13 +185,17 @@ function timeToMinutesToday(hhmmStr) {
 async function inferInbound(env, svc) {
   const prevAll = (svc.previousCallingPoints && svc.previousCallingPoints[0] && svc.previousCallingPoints[0].callingPoint) || [];
   const origin = prevAll.length ? prevAll[0] : { locationName: svc.locationName, crs: svc.crs, st: svc.std, platform: svc.platform };
-  if (!origin.crs || !origin.st || !origin.platform) return null; // need a platform to make a plausible guess at all
+  if (!origin.crs || !origin.st || !origin.platform) return null; // no platform info to go on — not an error, just nothing to infer from
 
   const depMin = timeToMinutesToday(origin.st);
   if (depMin == null) return null;
 
   const arrResp = await rdmGet(env, `/GetArrBoardWithDetails/${origin.crs}?numRows=15&timeWindow=45`, "DARWIN_ARRIVALS_PRODUCT");
-  if (!arrResp.ok) return null; // arrivals product not entitled, or no data — silently omit
+  if (!arrResp.ok) {
+    // A real API failure (wrong product/key, RouteFailed, etc.) — propagate so the
+    // caller can surface it, rather than silently looking like "nothing to infer".
+    throw new Error(`arrivals board error (status ${arrResp.status}): ${(arrResp.detail || "").slice(0, 150)}`.trim());
+  }
   const arrivals = Array.isArray(arrResp.data.trainServices) ? arrResp.data.trainServices : [];
 
   let best = null, bestMin = -Infinity;
@@ -194,15 +210,17 @@ async function inferInbound(env, svc) {
     if (gap < 2 || gap > 35) continue;   // plausible turnaround window
     if (arrMin > bestMin) { bestMin = arrMin; best = a; }
   }
-  if (!best) return null;
+  if (!best) return null; // queried fine, genuinely no plausible match — not an error
   const inId = best.serviceIdPercentEncoded || best.serviceID;
   if (!inId) return null;
 
   const inResp = await rdmGet(env, `/GetServiceDetails/${encodeURIComponent(inId)}`, "DARWIN_SERVICE_PRODUCT");
-  if (!inResp.ok) return null;
+  if (!inResp.ok) {
+    throw new Error(`inbound service-details error (status ${inResp.status}): ${(inResp.detail || "").slice(0, 150)}`.trim());
+  }
   const p = buildProgress(inResp.data);
   return {
-    origin: p.origin, destination: p.destination, operator: p.operator, stops: p.stops,
+    origin: p.origin, destination: p.destination, operator: p.operator, stops: p.stops, pos: p.pos,
     platform: origin.platform,
     dueArr: hhmm(best.sta), expectedArr: hhmm(best.eta) || hhmm(best.ata),
     inferred: true,

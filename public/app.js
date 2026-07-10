@@ -703,9 +703,12 @@ function initPull() {
   s.addEventListener("touchend", () => { pulling = false; });
 }
 
-/* ---- leg detail (Pass 3 fills rail; basic for now) ---- */
+/* ---- leg detail ---- */
+let currentDetailLeg = null;   // so toggleServiceDetail can look up the summary row's own data (destination, platform, countdown) without re-fetching it
+
 function openLegDetail(leg) {
   show("leg");
+  currentDetailLeg = leg;
   el("leg-detail-mode").textContent = MODE_LABEL[leg.mode] + " · " + titleFor(leg);
   const board = boards[leg.id] || { services: [] };
   const svcs = board.services || [];
@@ -726,29 +729,31 @@ function openLegDetail(leg) {
     ${crowdLine}
     ${svcs.length ? svcs.map((s) => {
       const big = isRail ? (s.std || s.estimated || "") : (s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown + " min") : "");
-      const live = leg.mode === "tube" && s.currentLocation ? `<div class="detail-live">${esc(s.currentLocation)}</div>` : "";
-      const svcId = isRail ? (s.serviceID || "") : "";
+      // Both rail and tube rows are expandable now — rail loads a full calling-point
+      // timeline from Darwin; tube builds a simpler one client-side (see toggleServiceDetail).
+      const svcId = s.serviceID || "";
       const chevron = svcId ? '<svg class="detail-chevron" data-chevron viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>' : "";
       return `<div class="detail-row${svcId ? " clickable" : ""}" ${svcId ? `data-svc-id="${esc(svcId)}"` : ""}>
         <div class="detail-row-top"><span class="detail-time">${esc(big)}</span><span class="detail-dest">${esc(s.destination || "")}</span><span class="leg-badge ${s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "good"}">${esc(s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? "exp " + s.estimated : "Delayed") : (s.platform ? "Pl " + s.platform : "On time"))}</span>${chevron}</div>
-        ${live}
         ${svcId ? '<div class="detail-expand" data-expand hidden></div>' : ""}
       </div>`;
     }).join("") : '<p class="hint">No live services right now.</p>'}`;
 
-  if (isRail) {
-    const rows = el("leg-detail-body").querySelectorAll(".detail-row[data-svc-id]");
-    rows.forEach((row) => {
-      row.onclick = (e) => { if (!e.target.closest(".detail-expand")) toggleServiceDetail(row); };
-    });
-    if (rows.length) toggleServiceDetail(rows[0]);   // first train open by default
-  }
+  const rows = el("leg-detail-body").querySelectorAll(".detail-row[data-svc-id]");
+  rows.forEach((row) => {
+    row.onclick = (e) => { if (!e.target.closest(".detail-expand")) toggleServiceDetail(row, leg); };
+  });
+  if (rows.length) toggleServiceDetail(rows[0], leg);   // first train open by default
 }
 
-// Tap a rail service row to load and show its full calling-point progress — live
-// position (which stops it's already called at) and, where we can work it out, the
-// earlier working that likely forms it. Lazy: nothing is fetched until you tap.
-async function toggleServiceDetail(row) {
+// Tap a service row to load and show its full live-position timeline — for rail this
+// calls Darwin's GetServiceDetails for the real calling-point schedule; for tube there's
+// no equivalent (TfL's live arrivals API gives one prediction per train, not a full
+// calling-point-by-calling-point schedule the way Darwin does), so it's built from the
+// onward-station list already resolved at save time, with the boarding stop shown as
+// "here" and TfL's currentLocation text as the caption — a simpler, less precise
+// approximation, not the same thing as rail's version.
+async function toggleServiceDetail(row, leg) {
   const panel = row.querySelector("[data-expand]");
   const chevron = row.querySelector("[data-chevron]");
   if (!panel) return;
@@ -759,6 +764,17 @@ async function toggleServiceDetail(row) {
   panel.hidden = false;
   chevron?.classList.add("open");
   if (panel.dataset.loaded) return;
+
+  const board = boards[leg.id] || {};
+  const s = (board.services || []).find((x) => x.serviceID === row.dataset.svcId) || {};
+
+  if (leg.mode !== "rail") {
+    panel.innerHTML = renderTubePanel(leg, s);
+    panel.dataset.loaded = "1";
+    scrollTimelineToCurrent(panel);
+    return;
+  }
+
   panel.innerHTML = '<p class="hint" style="padding:6px 0">Loading live position…</p>';
   try {
     const r = await fetch(`/api/rail/service?id=${encodeURIComponent(row.dataset.svcId)}`);
@@ -774,55 +790,135 @@ async function toggleServiceDetail(row) {
       panel.innerHTML = `<p class="hint" style="padding:6px 0">No live stop information for this train${d._rawKeys ? ` (unexpected response shape: ${esc(d._rawKeys.join(", "))})` : ""}.</p>`;
       return;
     }
-    panel.innerHTML = renderServicePanel(d);
+    panel.innerHTML = renderRailPanel(leg, s, d);
     panel.dataset.loaded = "1";
+    scrollTimelineToCurrent(panel);
   } catch (e) {
     panel.innerHTML = `<p class="hint" style="padding:6px 0">Couldn't load live position: ${esc(e.message || "network error")}</p>`;
   }
 }
 
-function renderServicePanel(d) {
-  const stopsHtml = (d.stops || []).map((s) => {
-    const cls = s.current ? "current" : s.passed ? "passed" : "";
-    const time = s.atd || s.etd || s.std || "";
-    const plat = s.platform ? `<span class="svc-stop-plat">Plat ${esc(s.platform)}</span>` : "";
-    return `<div class="svc-stop ${cls}"><span class="svc-stop-time">${esc(time)}</span><span class="svc-stop-name">${esc(s.name)}</span>${plat}${s.cancelled ? '<span class="leg-badge bad">Cancelled</span>' : ""}</div>`;
-  }).join("");
+function scrollTimelineToCurrent(panel) {
+  const cur = panel.querySelector(".htl-col.current");
+  if (cur) cur.scrollIntoView({ inline: "center", block: "nearest" });
+}
 
-  // "Formed by" — a plausible-turnaround guess when it isn't a confirmed link (see
-  // functions/api/rail/service.js) — worded "likely" rather than stated as fact.
-  // Styled the same way as the outbound: its own header, dot, and mini stop list,
-  // collapsed by default since it's a bonus detail, not the main answer.
-  const inbound = d.inbound ? renderInbound(d.inbound) : "";
+// Minutes between two "HH:MM" strings, same-day (good enough for a single commute leg).
+function minutesBetween(a, b) {
+  const p = (t) => { const m = /^(\d{2}):(\d{2})/.exec(t || ""); return m ? (+m[1]) * 60 + (+m[2]) : null; };
+  const x = p(a), y = p(b);
+  if (x == null || y == null) return null;
+  let d = y - x;
+  if (d < 0) d += 1440;
+  return d;
+}
+
+// The rich header — destination, "calls X", DEPARTS time, status line, big countdown,
+// platform + operator — matching the reference app's layout as closely as the data allows.
+function renderRailPanel(leg, s, d) {
+  const destStop = (d.stops || []).find((x) => x.crs === leg.to_id) || (d.stops || []).find((x) => x.name && leg.to_name && x.name.toLowerCase() === leg.to_name.toLowerCase());
+  const arrAtDest = destStop ? (destStop.atd || destStop.etd || destStop.std) : null;
+  const depTime = s.std || s.estimated || "";
+  const durMin = arrAtDest ? minutesBetween(depTime, arrAtDest) : null;
+  const countdown = s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown) : null;
+  const countdownUnit = s.countdown != null && s.countdown > 1 ? "min" : "";
+  const statusWord = s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? `exp ${s.estimated}` : "Delayed") : "On time";
+  const statusCls = s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "good";
+
+  const statusLine = [
+    statusWord,
+    durMin != null ? `${durMin} min` : null,
+    arrAtDest ? `arr ${esc(leg.to_name)} ${arrAtDest}` : null,
+  ].filter(Boolean).join(" · ");
+
+  const inboundBlock = d.inbound
+    ? renderInbound(d.inbound)
+    : `<div class="svc-inbound-note">${esc(d._inboundNote || "No formed-by information available.")}</div>`;
 
   return `
-    <div class="svc-header">
-      <span class="svc-route">${esc(d.origin || "—")} → ${esc(d.destination || "—")}</span>
-      ${d.operator ? `<span class="svc-operator">${esc(d.operator)}</span>` : ""}
+    <div class="svc-live-tag"><span class="svc-live-dot"></span>LIVE</div>
+    <div class="svc-dest">${esc(d.destination || s.destination || "—")}</div>
+    <div class="svc-calls">calls ${esc(leg.to_name)}</div>
+    <div class="svc-departs-row">
+      <div>
+        <div class="svc-departs-label">DEPARTS</div>
+        <div class="svc-departs-time">${esc(depTime)}</div>
+        <div class="svc-status-line ${statusCls}">${statusLine}</div>
+      </div>
+      ${countdown != null ? `<div class="svc-countdown"><span class="svc-countdown-num">${esc(String(countdown))}${countdownUnit ? ` <span>${countdownUnit}</span>` : ""}</span><span class="svc-countdown-label">TO GO</span></div>` : ""}
     </div>
+    <div class="svc-platform-row">Platform <span class="svc-plat-pill">${esc(s.platform || "—")}</span> · ${esc(d.operator || s.operator || "")}</div>
+    <div class="svc-divider"></div>
     <p class="svc-caption">${esc(d.caption || "")}</p>
-    <div class="svc-stops">${stopsHtml}</div>
-    ${inbound}`;
+    ${renderTimeline(d.stops, d.pos)}
+    <div class="svc-divider"></div>
+    ${inboundBlock}`;
+}
+
+// Tube's simpler equivalent — no per-stop schedule available, so this shows the route
+// ahead (boarding stop + the onward stations already resolved at save time) with the
+// boarding stop marked as "here" and TfL's own currentLocation text as the caption.
+function renderTubePanel(leg, s) {
+  const names = [leg.from_name, ...(leg.tubeOnward || [])].slice(0, 9);
+  const stops = names.map((name, i) => ({ name, current: i === 0, passed: false, std: null }));
+  const countdown = s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown) : null;
+  const countdownUnit = s.countdown != null && s.countdown > 1 ? "min" : "";
+  return `
+    <div class="svc-live-tag"><span class="svc-live-dot"></span>LIVE</div>
+    <div class="svc-dest">${esc(s.destination || "—")}</div>
+    <div class="svc-calls">calls ${esc(leg.to_name)}</div>
+    <div class="svc-departs-row">
+      <div>
+        <div class="svc-departs-label">DUE</div>
+        <div class="svc-departs-time">${esc(s.currentLocation || "En route")}</div>
+      </div>
+      ${countdown != null ? `<div class="svc-countdown"><span class="svc-countdown-num">${esc(String(countdown))}${countdownUnit ? ` <span>${countdownUnit}</span>` : ""}</span><span class="svc-countdown-label">TO GO</span></div>` : ""}
+    </div>
+    <div class="svc-divider"></div>
+    <p class="hint" style="margin-bottom:10px">TfL's live tube data gives one prediction per train, not a full stop-by-stop schedule like National Rail — so this shows the route ahead rather than a precisely tracked position.</p>
+    ${renderTimeline(stops, 0)}`;
+}
+
+// Shared horizontal "live position" timeline — a scrollable track of dots, times above,
+// names below, current stop highlighted, with a filled progress line up to `pos`
+// (a fractional stop index, e.g. 2.4 = 40% of the way from stop 2 to stop 3).
+function renderTimeline(stops, pos) {
+  if (!stops || !stops.length) return '<p class="hint" style="padding:4px 0">No route information.</p>';
+  const n = stops.length;
+  const colW = 78;
+  const trackWidth = (n - 1) * colW;
+  const fillWidth = Math.max(0, Math.min(n - 1, pos || 0)) * colW;
+  const cols = stops.map((s) => {
+    const cls = s.current ? "current" : s.passed ? "passed" : "";
+    const time = s.atd || s.etd || s.std || "";
+    return `<div class="htl-col ${cls}" style="width:${colW}px">
+      ${time ? `<div class="htl-time">${esc(time)}</div>` : '<div class="htl-time">&nbsp;</div>'}
+      <div class="htl-dot"></div>
+      <div class="htl-name">${esc(s.name)}</div>
+      ${s.platform ? `<div class="htl-plat">P${esc(s.platform)}</div>` : ""}
+    </div>`;
+  }).join("");
+  return `<div class="htl-wrap"><div class="htl-track" style="width:${trackWidth + colW}px">
+    <div class="htl-line" style="width:${trackWidth}px;left:${colW / 2}px"></div>
+    <div class="htl-fill" style="width:${fillWidth}px;left:${colW / 2}px"></div>
+    <div class="htl-cols">${cols}</div>
+  </div></div>`;
 }
 
 function renderInbound(inb) {
-  const stopsHtml = (inb.stops || []).map((s) => {
-    const cls = s.current ? "current" : s.passed ? "passed" : "";
-    const time = s.atd || s.etd || s.std || "";
-    return `<div class="svc-stop ${cls}"><span class="svc-stop-time">${esc(time)}</span><span class="svc-stop-name">${esc(s.name)}</span></div>`;
-  }).join("");
   const lead = inb.inferred ? "Likely formed by" : "Formed by";
   const bits = [
     `${lead} the ${esc(inb.origin)} → ${esc(inb.destination)} working`,
-    inb.platform ? `due platform ${esc(inb.platform)}` : null,
+    inb.platform ? `Plat ${esc(inb.platform)}` : null,
     inb.expectedArr ? `expected ${esc(inb.expectedArr)}` : null,
-  ].filter(Boolean).join(", ");
+  ].filter(Boolean).join(" · ");
   return `<div class="svc-inbound">
     <button class="svc-inbound-toggle" data-inbound-toggle onclick="this.parentElement.classList.toggle('open')">
+      <span class="svc-inbound-dot"></span>
       <span class="svc-inbound-label">${bits}</span>
       <svg class="detail-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
     </button>
-    <div class="svc-inbound-body"><div class="svc-stops">${stopsHtml}</div></div>
+    <div class="svc-inbound-body">${renderTimeline(inb.stops, inb.pos)}</div>
   </div>`;
 }
 
