@@ -497,43 +497,53 @@ function renderDigest(legs) {
 
 /* ---- fetching boards ---- */
 // Every load cycle (initial boot, manual refresh, 20s auto-refresh, direction toggle)
-// gets a generation number. Callbacks that resolve after a *newer* cycle has already
-// started check their gen against the current one and drop themselves instead of
-// writing stale data / forcing a redundant render — this is what fixed the "gets
-// confused when I click between home and work" behaviour: rapid AM/PM toggling used
-// to leave old in-flight fetches free to land whenever they liked.
-let loadGen = 0;
+// aborts whatever the previous cycle still had in flight. Just ignoring stale *results*
+// (via a generation counter) wasn't enough — the old requests kept running in the
+// background, competing for the browser's connection limit and for the TfL/Darwin
+// backends with the request you're actually waiting on. Rapid work→home→work clicking
+// could leave 2-3 old fetches per leg still in flight, starving the current one — that
+// was the "fails to load for ages" behaviour. Aborting the previous cycle up front fixes
+// that at the source.
+let currentLoad = null; // AbortController for the in-flight loadBoards() cycle, if any
 
 async function loadBoards() {
-  const gen = ++loadGen;
+  currentLoad?.abort();
+  const controller = new AbortController();
+  currentLoad = controller;
   const legs = activeLegs();
   // Render each card as its board arrives, rather than blocking on the slowest.
   await Promise.all(legs.map(async (leg) => {
-    try { const b = await fetchBoard(leg); if (gen !== loadGen) return; boards[leg.id] = b; }
-    catch (e) { if (gen !== loadGen) return; boards[leg.id] = { services: [] }; }
-    if (gen === loadGen && !el("screen-home").hidden) renderHome();
+    try {
+      const b = await fetchBoard(leg, controller.signal);
+      if (controller.signal.aborted) return;
+      boards[leg.id] = b;
+    } catch (e) {
+      if (controller.signal.aborted) return;   // cancelled by a newer toggle/refresh — not a real failure
+      boards[leg.id] = { services: [] };
+    }
+    if (!controller.signal.aborted && !el("screen-home").hidden) renderHome();
   }));
 }
 
-async function fetchBoard(leg) {
+async function fetchBoard(leg, signal) {
   if (leg.mode === "tube") {
     // Direction filtering removed for now — this shows all arrivals on the line at
     // this stop, both directions, unfiltered. Being revisited later.
-    const r = await fetch(`/api/tube/board?stop=${encodeURIComponent(leg.from_id)}&line=${encodeURIComponent(leg.line)}`);
+    const r = await fetch(`/api/tube/board?stop=${encodeURIComponent(leg.from_id)}&line=${encodeURIComponent(leg.line)}`, { signal });
     return r.ok ? await r.json() : { services: [] };
   }
   if (leg.mode === "bus") {
     const stop = leg._reversed ? (leg.rev_from_id || leg.from_id) : leg.from_id;
-    const r = await fetch(`/api/bus/board?stop=${encodeURIComponent(stop)}&line=${encodeURIComponent(leg.route || leg.line)}`);
+    const r = await fetch(`/api/bus/board?stop=${encodeURIComponent(stop)}&line=${encodeURIComponent(leg.route || leg.line)}`, { signal });
     const board = r.ok ? await r.json() : { services: [] };
     try {
-      const dr = await fetch(`/api/bus/disruption?lines=${encodeURIComponent(leg.route || leg.line)}`);
+      const dr = await fetch(`/api/bus/disruption?lines=${encodeURIComponent(leg.route || leg.line)}`, { signal });
       const dd = await dr.json();
       if (dd.hasDisruption) board.disruption = dd.disruptions[0]?.description || "Diversion";
     } catch (e) {}
     return board;
   }
-  const r = await fetch(`/api/rail/board?from=${encodeURIComponent(leg.from_id)}&to=${encodeURIComponent(leg.to_id)}`);
+  const r = await fetch(`/api/rail/board?from=${encodeURIComponent(leg.from_id)}&to=${encodeURIComponent(leg.to_id)}`, { signal });
   return r.ok ? await r.json() : { services: [] };
 }
 
