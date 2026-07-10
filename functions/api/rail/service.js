@@ -45,10 +45,6 @@ async function rdmGet(env, path) {
 function hhmm(t) {
   return typeof t === "string" && /^\d{2}:\d{2}/.test(t) ? t.slice(0, 5) : null;
 }
-function toMinutes(hhmmStr) {
-  const m = typeof hhmmStr === "string" && hhmmStr.match(/^(\d{2}):(\d{2})/);
-  return m ? (+m[1]) * 60 + (+m[2]) : null;
-}
 
 export async function onRequest(context) {
   const { request, env } = context;
@@ -58,10 +54,18 @@ export async function onRequest(context) {
   if (!env.DARWIN_APIKEY) return json({ error: "DARWIN_APIKEY not configured" }, 500);
 
   const svcResp = await rdmGet(env, `/GetServiceDetails/${encodeURIComponent(id)}`);
-  if (!svcResp.ok) return json({ error: "RDM error", status: svcResp.status, detail: svcResp.detail }, 502);
+  // Surface the real failure instead of a generic message — this is exactly the kind
+  // of thing that was silently swallowed before and made a real bug look mysterious.
+  if (!svcResp.ok) return json({ error: "RDM error", status: svcResp.status, endpoint: svcResp.endpoint, detail: svcResp.detail }, 502);
   const svc = svcResp.data;
 
   const result = buildProgress(svc);
+  if (!result.stops.length) {
+    // We got a response but couldn't find any calling points in it — most likely means
+    // RDM's JSON shape for this field differs from what we're expecting. Echo the raw
+    // top-level keys so this is diagnosable rather than a silent empty timeline.
+    result._rawKeys = Object.keys(svc || {});
+  }
 
   try {
     const inbound = await inferInbound(env, svc);
@@ -71,12 +75,25 @@ export async function onRequest(context) {
   return json(result, 200, { "Cache-Control": "public, max-age=20" });
 }
 
+// RDM's JSON conversion of the calling-point-list XML structure isn't confirmed from
+// stable documentation, so this tries a few plausible shapes rather than assuming one:
+//   subsequentCallingPoints[0].callingPoint      (array-of-wrapper, "callingPoint")
+//   subsequentCallingPoints[0].callingPointList  (array-of-wrapper, "callingPointList")
+//   subsequentCallingPoints.callingPoint         (single wrapper object, not an array)
+function extractCallingPoints(node) {
+  if (!node) return [];
+  const wrapper = Array.isArray(node) ? node[0] : node;
+  if (!wrapper) return [];
+  const list = wrapper.callingPoint || wrapper.callingPointList || wrapper.callingPoints;
+  return Array.isArray(list) ? list : [];
+}
+
 /* Turn GetServiceDetails' previous/here/subsequent calling points into a flat stop
    list with a "current position" caption, the same shape as maldenTrains' buildProgress
    but driven by Darwin's std/etd/atd fields instead of RTT's temporalData. */
 function buildProgress(svc) {
-  const prev = (svc.previousCallingPoints && svc.previousCallingPoints[0] && svc.previousCallingPoints[0].callingPoint) || [];
-  const subs = (svc.subsequentCallingPoints && svc.subsequentCallingPoints[0] && svc.subsequentCallingPoints[0].callingPoint) || [];
+  const prev = extractCallingPoints(svc.previousCallingPoints);
+  const subs = extractCallingPoints(svc.subsequentCallingPoints);
   const here = {
     locationName: svc.locationName, crs: svc.crs,
     st: svc.std || svc.sta, et: svc.etd || svc.eta, at: svc.atd || svc.ata,
@@ -100,11 +117,32 @@ function buildProgress(svc) {
   const currentIdx = lastDeparted >= 0 ? Math.min(lastDeparted + 1, stops.length - 1) : 0;
   stops.forEach((s, i) => { s.passed = i < currentIdx; s.current = i === currentIdx; });
 
+  // Fractional position between "last departed" and "next stop", ported from
+  // maldenTrains' computePosition — interpolates using elapsed time vs the scheduled
+  // gap between the two, so the caption can say "left X, approaching Y" instead of a
+  // flat "departed/next" with no sense of how far along it is.
   let caption = "No live information.";
   if (stops.length) {
-    if (lastDeparted < 0) caption = `Not yet departed ${stops[0].name}`;
-    else if (currentIdx >= stops.length - 1 && stops[stops.length - 1].departed) caption = `Arrived at ${stops[stops.length - 1].name}`;
-    else caption = `Departed ${stops[lastDeparted].name}, next ${stops[currentIdx].name}`;
+    if (lastDeparted < 0) {
+      caption = `Not yet departed ${stops[0].name}`;
+    } else if (lastDeparted >= stops.length - 1) {
+      caption = `Arrived at ${stops[stops.length - 1].name}`;
+    } else {
+      const from = stops[lastDeparted], to = stops[currentIdx];
+      const depMin = timeToMinutesToday(from.atd || from.etd || from.std);
+      const arrMin = timeToMinutesToday(to.etd || to.std);
+      let frac = null;
+      if (depMin != null && arrMin != null) {
+        const span = arrMin - depMin;
+        if (span > 0) {
+          const nowMin = (new Date().getHours() * 60 + new Date().getMinutes());
+          frac = Math.max(0, Math.min(1, (nowMin - depMin) / span));
+        }
+      }
+      caption = frac != null && frac > 0.08 && frac < 0.92
+        ? `Left ${from.name}, approaching ${to.name}`
+        : `Departed ${from.name}, next ${to.name}`;
+    }
   }
 
   return {
@@ -116,12 +154,17 @@ function buildProgress(svc) {
   };
 }
 
+function timeToMinutesToday(hhmmStr) {
+  const m = typeof hhmmStr === "string" && hhmmStr.match(/^(\d{2}):(\d{2})/);
+  return m ? (+m[1]) * 60 + (+m[2]) : null;
+}
+
 async function inferInbound(env, svc) {
   const prevAll = (svc.previousCallingPoints && svc.previousCallingPoints[0] && svc.previousCallingPoints[0].callingPoint) || [];
   const origin = prevAll.length ? prevAll[0] : { locationName: svc.locationName, crs: svc.crs, st: svc.std, platform: svc.platform };
   if (!origin.crs || !origin.st || !origin.platform) return null; // need a platform to make a plausible guess at all
 
-  const depMin = toMinutes(origin.st);
+  const depMin = timeToMinutesToday(origin.st);
   if (depMin == null) return null;
 
   const arrResp = await rdmGet(env, `/GetArrBoardWithDetails/${origin.crs}?numRows=15&timeWindow=45`);
@@ -133,7 +176,7 @@ async function inferInbound(env, svc) {
     const plat = a.platform;
     if (!plat || String(plat) !== String(origin.platform)) continue;   // same platform — turnarounds almost always reuse it
     const arrTime = a.ata || a.eta || a.sta;
-    const arrMin = toMinutes(arrTime);
+    const arrMin = timeToMinutesToday(arrTime);
     if (arrMin == null) continue;
     let gap = depMin - arrMin;
     if (gap < 0) gap += 1440; // midnight wrap

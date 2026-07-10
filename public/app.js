@@ -737,9 +737,11 @@ function openLegDetail(leg) {
     }).join("") : '<p class="hint">No live services right now.</p>'}`;
 
   if (isRail) {
-    el("leg-detail-body").querySelectorAll(".detail-row[data-svc-id]").forEach((row) => {
+    const rows = el("leg-detail-body").querySelectorAll(".detail-row[data-svc-id]");
+    rows.forEach((row) => {
       row.onclick = (e) => { if (!e.target.closest(".detail-expand")) toggleServiceDetail(row); };
     });
+    if (rows.length) toggleServiceDetail(rows[0]);   // first train open by default
   }
 }
 
@@ -761,11 +763,21 @@ async function toggleServiceDetail(row) {
   try {
     const r = await fetch(`/api/rail/service?id=${encodeURIComponent(row.dataset.svcId)}`);
     const d = await r.json();
-    if (!r.ok || d.error) { panel.innerHTML = '<p class="hint" style="padding:6px 0">Couldn\'t load live position right now.</p>'; return; }
+    if (!r.ok || d.error) {
+      // Show the real reason, not a generic message — this is the whole point of not
+      // repeating the earlier mistake of swallowing errors into "couldn't load".
+      const why = d.detail || d.error || `HTTP ${r.status}`;
+      panel.innerHTML = `<p class="hint" style="padding:6px 0">Couldn't load live position: ${esc(why)}</p>`;
+      return;
+    }
+    if (!d.stops || !d.stops.length) {
+      panel.innerHTML = `<p class="hint" style="padding:6px 0">No live stop information for this train${d._rawKeys ? ` (unexpected response shape: ${esc(d._rawKeys.join(", "))})` : ""}.</p>`;
+      return;
+    }
     panel.innerHTML = renderServicePanel(d);
     panel.dataset.loaded = "1";
   } catch (e) {
-    panel.innerHTML = '<p class="hint" style="padding:6px 0">Couldn\'t load live position right now.</p>';
+    panel.innerHTML = `<p class="hint" style="padding:6px 0">Couldn't load live position: ${esc(e.message || "network error")}</p>`;
   }
 }
 
@@ -773,16 +785,45 @@ function renderServicePanel(d) {
   const stopsHtml = (d.stops || []).map((s) => {
     const cls = s.current ? "current" : s.passed ? "passed" : "";
     const time = s.atd || s.etd || s.std || "";
-    return `<div class="svc-stop ${cls}"><span class="svc-stop-time">${esc(time)}</span><span class="svc-stop-name">${esc(s.name)}</span>${s.cancelled ? '<span class="leg-badge bad">Cancelled</span>' : ""}</div>`;
+    const plat = s.platform ? `<span class="svc-stop-plat">Plat ${esc(s.platform)}</span>` : "";
+    return `<div class="svc-stop ${cls}"><span class="svc-stop-time">${esc(time)}</span><span class="svc-stop-name">${esc(s.name)}</span>${plat}${s.cancelled ? '<span class="leg-badge bad">Cancelled</span>' : ""}</div>`;
   }).join("");
-  // "Formed by" is a best-effort platform/timing guess when it isn't a confirmed link
-  // (see functions/api/rail/service.js) — worded as "likely" rather than stated as fact.
-  const inbound = d.inbound
-    ? `<div class="svc-inbound"><p class="hint" style="margin-bottom:0">Formed by the ${esc(d.inbound.origin)} → ${esc(d.inbound.destination)} working${d.inbound.inferred ? " (likely)" : ""}${d.inbound.platform ? `, due platform ${esc(d.inbound.platform)}` : ""}${d.inbound.expectedArr ? `, expected ${esc(d.inbound.expectedArr)}` : ""}</p></div>`
-    : "";
-  return `<p class="hint" style="margin:2px 0 8px;font-weight:600;color:var(--ink)">${esc(d.caption || "")}</p>
+
+  // "Formed by" — a plausible-turnaround guess when it isn't a confirmed link (see
+  // functions/api/rail/service.js) — worded "likely" rather than stated as fact.
+  // Styled the same way as the outbound: its own header, dot, and mini stop list,
+  // collapsed by default since it's a bonus detail, not the main answer.
+  const inbound = d.inbound ? renderInbound(d.inbound) : "";
+
+  return `
+    <div class="svc-header">
+      <span class="svc-route">${esc(d.origin || "—")} → ${esc(d.destination || "—")}</span>
+      ${d.operator ? `<span class="svc-operator">${esc(d.operator)}</span>` : ""}
+    </div>
+    <p class="svc-caption">${esc(d.caption || "")}</p>
     <div class="svc-stops">${stopsHtml}</div>
     ${inbound}`;
+}
+
+function renderInbound(inb) {
+  const stopsHtml = (inb.stops || []).map((s) => {
+    const cls = s.current ? "current" : s.passed ? "passed" : "";
+    const time = s.atd || s.etd || s.std || "";
+    return `<div class="svc-stop ${cls}"><span class="svc-stop-time">${esc(time)}</span><span class="svc-stop-name">${esc(s.name)}</span></div>`;
+  }).join("");
+  const lead = inb.inferred ? "Likely formed by" : "Formed by";
+  const bits = [
+    `${lead} the ${esc(inb.origin)} → ${esc(inb.destination)} working`,
+    inb.platform ? `due platform ${esc(inb.platform)}` : null,
+    inb.expectedArr ? `expected ${esc(inb.expectedArr)}` : null,
+  ].filter(Boolean).join(", ");
+  return `<div class="svc-inbound">
+    <button class="svc-inbound-toggle" data-inbound-toggle onclick="this.parentElement.classList.toggle('open')">
+      <span class="svc-inbound-label">${bits}</span>
+      <svg class="detail-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+    </button>
+    <div class="svc-inbound-body"><div class="svc-stops">${stopsHtml}</div></div>
+  </div>`;
 }
 
 async function bootHome() {
