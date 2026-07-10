@@ -321,6 +321,41 @@ async function checkDirect(from, to) {
   return false;
 }
 
+/* ---- tube direction resolution (used by setup save + home) ---- */
+let boards = {};                // legId -> board data
+let dirCache = {};              // cache for tube direction lookups
+let dirPending = {};            // key -> in-flight direction lookup Promise, so a prewarm
+                                 // and a home-screen load for the same leg share one fetch
+                                 // instead of racing two identical requests to TfL
+
+// Resolves (and caches) the direction lookup for one leg, sharing a single in-flight
+// request across any callers that ask for the same line/from/to at the same time —
+// e.g. a prewarm kicked off at save-time and a home-screen load landing moments later.
+function resolveDirection(leg) {
+  const key = `${leg.line}|${leg.from_id}|${leg.to_id}`;
+  if (dirCache[key]) return Promise.resolve(dirCache[key]);
+  if (dirPending[key]) return dirPending[key];
+  const p = fetch(`/api/tube/direction?line=${encodeURIComponent(leg.line)}&from=${encodeURIComponent(leg.from_id)}&to=${encodeURIComponent(leg.to_id)}`)
+    .then((r) => (r.ok ? r.json() : { direction: null, onward: [] }))
+    .catch(() => ({ direction: null, onward: [] }))
+    .then((d) => { dirCache[key] = d; delete dirPending[key]; return d; });
+  dirPending[key] = p;
+  return p;
+}
+
+// Kick off TfL's line-topology lookup for each tube leg's direction as early as possible
+// (right after save, and again at boot) instead of only starting it cold the first time
+// the home screen tries to render that leg. dirCache is in-memory only and resets on
+// reload, but starting these in the background means the lookup is often already
+// finished — or at least well underway — by the time loadBoards() actually needs it,
+// rather than the user watching "Checking direction…" while it starts from scratch.
+function prewarmDirections(legs) {
+  [...legs, ...legs.map(reverseLeg)].forEach((leg) => {
+    if (leg.mode !== "tube" || !leg.line || !leg.from_id || !leg.to_id) return;
+    resolveDirection(leg);
+  });
+}
+
 /* ---- save ---- */
 async function saveCommute() {
   const incomplete = commute.legs.filter((l) => !l.from_id || !l.to_id || (l.mode === "tube" && !l.line));
@@ -339,6 +374,7 @@ async function saveCommute() {
     // strip transient fields before saving
     delete leg._routeDirs; delete leg._lineStops; delete leg._collapsed; delete leg._lineCollapsed;
   }
+  prewarmDirections(commute.legs);   // start the heavy lookup now, not when home screen mounts
   await apiSave(commute);
   await bootHome();
 }
@@ -347,8 +383,6 @@ async function saveCommute() {
    HOME — live
    ============================================================ */
 let direction = "am";           // "am" (as set up) | "pm" (reversed)
-let boards = {};                // legId -> board data
-let dirCache = {};              // cache for tube direction lookups
 let refreshTimer = null;
 let tick = null;
 
@@ -517,12 +551,26 @@ async function loadBoards() {
   }));
 }
 
+// Filter arrivals down to the boarding direction, using TfL's own `direction` field
+// where it's populated and falling back to matching destination names against the
+// resolved "onward" station list (TfL doesn't always set `direction` on an arrival).
+function filterByDirection(board, dir) {
+  if ((!dir.direction || !board.services?.some((s) => s.direction)) && dir.onward?.length && board.services) {
+    const onward = new Set(dir.onward.map((n) => n.toLowerCase()));
+    const filt = board.services.filter((s) => s.destination && onward.has(s.destination.toLowerCase().replace(/ underground station$/, "").replace(/ station$/, "")));
+    if (filt.length) board.services = filt;
+  }
+  return board;
+}
+
 async function fetchBoard(leg, gen) {
   if (leg.mode === "tube") {
     // Fetch the board immediately (fast). If we don't yet know the direction for this
     // leg, mark the board as awaiting-direction so the card shows "Checking direction…"
-    // rather than briefly flashing trains going both ways. warmDirection() then resolves
-    // it and re-renders this card filtered.
+    // rather than briefly flashing trains going both ways. warmDirection() then filters
+    // these SAME arrivals once it resolves — it used to trigger a second full board
+    // fetch (another canonicalStop + arrivals + status round-trip to TfL) just to apply
+    // a filter, which was the main reason tube legs were slower than train legs to settle.
     const key = `${leg.line}|${leg.from_id}|${leg.to_id}`;
     const dir = dirCache[key];
     let url = `/api/tube/board?stop=${encodeURIComponent(leg.from_id)}&line=${encodeURIComponent(leg.line)}`;
@@ -531,15 +579,10 @@ async function fetchBoard(leg, gen) {
     const board = r.ok ? await r.json() : { services: [] };
     if (!dir) {
       board._awaitingDir = true;      // card renders "Checking direction…"
-      warmDirection(leg, gen);        // resolve + re-render this leg
+      warmDirection(leg, gen, board); // resolve, then filter these arrivals in place
       return board;
     }
-    if ((!dir.direction || !board.services?.some((s) => s.direction)) && dir.onward?.length && board.services) {
-      const onward = new Set(dir.onward.map((n) => n.toLowerCase()));
-      const filt = board.services.filter((s) => s.destination && onward.has(s.destination.toLowerCase().replace(/ underground station$/, "").replace(/ station$/, "")));
-      if (filt.length) board.services = filt;
-    }
-    return board;
+    return filterByDirection(board, dir);
   }
   if (leg.mode === "bus") {
     const stop = leg._reversed ? (leg.rev_from_id || leg.from_id) : leg.from_id;
@@ -556,21 +599,16 @@ async function fetchBoard(leg, gen) {
   return r.ok ? await r.json() : { services: [] };
 }
 
-// Warm the direction cache in the background, then re-render once so filtering applies.
-async function warmDirection(leg, gen) {
+// Resolve this leg's direction (sharing an in-flight request if one's already running —
+// see resolveDirection), then filter the arrivals we already fetched (rawBoard, from the
+// initial fetchBoard call) and render once. No second network round-trip to /api/tube/board.
+async function warmDirection(leg, gen, rawBoard) {
   const key = `${leg.line}|${leg.from_id}|${leg.to_id}`;
-  if (dirCache[key]) return;
-  try {
-    const r = await fetch(`/api/tube/direction?line=${encodeURIComponent(leg.line)}&from=${encodeURIComponent(leg.from_id)}&to=${encodeURIComponent(leg.to_id)}`);
-    dirCache[key] = r.ok ? await r.json() : { direction: null, onward: [] };
-  } catch (e) {
-    dirCache[key] = { direction: null, onward: [] };   // cache the miss so we don't loop
-  }
-  // A newer load cycle (another toggle/refresh) has since started — this leg will be
-  // (or already has been) re-fetched under that cycle, so don't write stale data here.
+  await resolveDirection(leg);
   if (gen !== loadGen) return;
-  try { boards[leg.id] = await fetchBoard(leg, gen); } catch (e) {}
-  if (gen === loadGen && !el("screen-home").hidden) renderHome();
+  const board = filterByDirection({ ...rawBoard, _awaitingDir: false }, dirCache[key]);
+  boards[leg.id] = board;
+  if (!el("screen-home").hidden) renderHome();
 }
 
 /* ---- refresh: button (flashes green), pull-to-refresh, auto 20s ---- */
@@ -628,6 +666,7 @@ async function bootHome() {
   const saved = await apiGet();
   if (saved && saved.legs && saved.legs.length) {
     commute = saved; await loadTubeLines();
+    prewarmDirections(commute.legs);   // fresh page load = empty dirCache; start warming immediately
     direction = autoDirection();
     renderHome();
     loadBoards();
