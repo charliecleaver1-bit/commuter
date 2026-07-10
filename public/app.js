@@ -376,6 +376,14 @@ function titleFor(leg) {
   return leg.mode === "tube" ? lineName(leg.line) : (leg.mode === "rail" ? "Train" : `Bus ${esc(leg.route || leg.line || "")}`);
 }
 
+// Tracks which set of leg ids (in order) is currently mounted in #commute, so
+// renderHome() can tell a genuine leg-set change (direction toggle, edit) — which
+// needs a fresh skeleton — apart from a board simply arriving, which should only
+// patch the one card in place. Rebuilding the whole list on every board arrival
+// was what caused the flashing: it destroyed and recreated every card, restarting
+// the reveal-on-scroll fade for cards that were already on screen.
+let renderedLegIds = null;
+
 function renderHome() {
   show("home");
   const legs = activeLegs();
@@ -387,28 +395,52 @@ function renderHome() {
   renderDigest(legs);
 
   const wrap = el("commute");
-  wrap.innerHTML = legs.map((leg, i) => {
-    const isLast = i === legs.length - 1;
-    const col = colourFor(leg);
-    const board = boards[leg.id];
-    const st = legStatus(leg, board);
-    return `<div class="leg" style="--segCol:${col};--nodeCol:${col};transition-delay:${i * 60}ms">
-      <div class="leg-spine"><div class="leg-node">${MODE_ICON[leg.mode]}</div>${isLast ? "" : '<div class="leg-connector"></div>'}</div>
-      <button class="leg-card ${st.card}" data-leg="${leg.id}" style="--segCol:${col}">
-        <div class="leg-top">
-          <div class="leg-line-name"><span class="leg-swatch" style="background:${col}"></span>${esc(titleFor(leg))}</div>
-          <span class="leg-badge ${st.badge}">${esc(st.label)}</span>
-        </div>
-        <div class="leg-route">${esc(leg.from_name)} → ${esc(leg.to_name)}</div>
-        <div class="times">${renderTimes(leg, board)}</div>
-        ${st.reason ? `<div class="leg-reason">${esc(st.reason)}</div>` : ""}
-      </button></div>`;
-  }).join("");
-  wrap.querySelectorAll("[data-leg]").forEach((b) => b.onclick = () => {
-    const leg = legs.find((l) => l.id === b.dataset.leg); if (leg) openLegDetail(leg);
-  });
-  revealOnScroll();
+  const idKey = legs.map((l) => l.id).join(",");
+  if (idKey !== renderedLegIds) {
+    wrap.innerHTML = legs.map((leg, i) => legSkeleton(leg, i, legs.length)).join("");
+    wrap.querySelectorAll("[data-leg]").forEach((b) => b.onclick = () => {
+      const leg = legs.find((l) => l.id === b.dataset.leg); if (leg) openLegDetail(leg);
+    });
+    renderedLegIds = idKey;
+    revealOnScroll();
+  }
+  legs.forEach((leg) => updateLegCard(leg));
 }
+
+function legSkeleton(leg, i, total) {
+  const isLast = i === total - 1;
+  const col = colourFor(leg);
+  return `<div class="leg" style="--segCol:${col};--nodeCol:${col};transition-delay:${i * 60}ms">
+    <div class="leg-spine"><div class="leg-node">${MODE_ICON[leg.mode]}</div>${isLast ? "" : '<div class="leg-connector"></div>'}</div>
+    <button class="leg-card" data-leg="${leg.id}" style="--segCol:${col}">
+      <div class="leg-top">
+        <div class="leg-line-name"><span class="leg-swatch" style="background:${col}"></span>${esc(titleFor(leg))}</div>
+        <span class="leg-badge checking" data-badge>…</span>
+      </div>
+      <div class="leg-route">${esc(leg.from_name)} → ${esc(leg.to_name)}</div>
+      <div class="times" data-times><span class="times-empty">Checking…</span></div>
+      <div class="leg-reason" data-reason hidden></div>
+    </button></div>`;
+}
+
+// Patch one card's content in place — badge, times, reason, and the problem/problem-amber
+// state class — without touching the surrounding DOM nodes. This is what makes board
+// refreshes (initial load, direction resolution, 20s auto-refresh) silent instead of flashy.
+function updateLegCard(leg) {
+  const card = document.querySelector(`.leg-card[data-leg="${cssEsc(leg.id)}"]`);
+  if (!card) return;
+  const board = boards[leg.id];
+  const st = legStatus(leg, board);
+  card.className = `leg-card ${st.card}`;
+  const badge = card.querySelector("[data-badge]");
+  badge.className = `leg-badge ${st.badge}`;
+  badge.textContent = st.label;
+  card.querySelector("[data-times]").innerHTML = renderTimes(leg, board);
+  const reasonEl = card.querySelector("[data-reason]");
+  if (st.reason) { reasonEl.hidden = false; reasonEl.textContent = st.reason; }
+  else { reasonEl.hidden = true; reasonEl.textContent = ""; }
+}
+function cssEsc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"); }
 
 function legStatus(leg, board) {
   if (!board) return { card: "", badge: "checking", label: "…", reason: null };
@@ -466,16 +498,26 @@ function renderDigest(legs) {
 }
 
 /* ---- fetching boards ---- */
+// Every load cycle (initial boot, manual refresh, 20s auto-refresh, direction toggle)
+// gets a generation number. Callbacks that resolve after a *newer* cycle has already
+// started check their gen against the current one and drop themselves instead of
+// writing stale data / forcing a redundant render — this is what fixed the "gets
+// confused when I click between home and work" behaviour: rapid AM/PM toggling used
+// to leave old in-flight fetches free to land whenever they liked.
+let loadGen = 0;
+
 async function loadBoards() {
+  const gen = ++loadGen;
   const legs = activeLegs();
   // Render each card as its board arrives, rather than blocking on the slowest.
   await Promise.all(legs.map(async (leg) => {
-    try { boards[leg.id] = await fetchBoard(leg); } catch (e) { boards[leg.id] = { services: [] }; }
-    if (!el("screen-home").hidden) renderHome();
+    try { const b = await fetchBoard(leg, gen); if (gen !== loadGen) return; boards[leg.id] = b; }
+    catch (e) { if (gen !== loadGen) return; boards[leg.id] = { services: [] }; }
+    if (gen === loadGen && !el("screen-home").hidden) renderHome();
   }));
 }
 
-async function fetchBoard(leg) {
+async function fetchBoard(leg, gen) {
   if (leg.mode === "tube") {
     // Fetch the board immediately (fast). If we don't yet know the direction for this
     // leg, mark the board as awaiting-direction so the card shows "Checking direction…"
@@ -489,7 +531,7 @@ async function fetchBoard(leg) {
     const board = r.ok ? await r.json() : { services: [] };
     if (!dir) {
       board._awaitingDir = true;      // card renders "Checking direction…"
-      warmDirection(leg);             // resolve + re-render this leg
+      warmDirection(leg, gen);        // resolve + re-render this leg
       return board;
     }
     if ((!dir.direction || !board.services?.some((s) => s.direction)) && dir.onward?.length && board.services) {
@@ -515,7 +557,7 @@ async function fetchBoard(leg) {
 }
 
 // Warm the direction cache in the background, then re-render once so filtering applies.
-async function warmDirection(leg) {
+async function warmDirection(leg, gen) {
   const key = `${leg.line}|${leg.from_id}|${leg.to_id}`;
   if (dirCache[key]) return;
   try {
@@ -524,9 +566,11 @@ async function warmDirection(leg) {
   } catch (e) {
     dirCache[key] = { direction: null, onward: [] };   // cache the miss so we don't loop
   }
-  // Re-fetch this leg's board now that direction is known (or known-unavailable).
-  try { boards[leg.id] = await fetchBoard(leg); } catch (e) {}
-  if (!el("screen-home").hidden) renderHome();
+  // A newer load cycle (another toggle/refresh) has since started — this leg will be
+  // (or already has been) re-fetched under that cycle, so don't write stale data here.
+  if (gen !== loadGen) return;
+  try { boards[leg.id] = await fetchBoard(leg, gen); } catch (e) {}
+  if (gen === loadGen && !el("screen-home").hidden) renderHome();
 }
 
 /* ---- refresh: button (flashes green), pull-to-refresh, auto 20s ---- */
@@ -612,8 +656,15 @@ el("btn-save").onclick = () => saveCommute();
 el("btn-delete-all").onclick = async () => { if (!confirm("Delete your whole commute? This can't be undone.")) return; await apiDelete(); commute = { legs: [], alerts: [] }; show("create"); };
 el("btn-leg-back").onclick = () => renderHome();
 el("btn-refresh").onclick = () => doRefresh(true);
-el("dir-am").onclick = () => { direction = "am"; boards = {}; renderHome(); loadBoards(); };
-el("dir-pm").onclick = () => { direction = "pm"; boards = {}; renderHome(); loadBoards(); };
+// Boards are keyed by leg id, and AM/PM legs already have distinct ids (reverseLeg
+// suffixes reversed legs with "-r"), so AM and PM each have their own slot in `boards`.
+// We used to wipe the whole cache on every toggle, which meant flicking back to a
+// direction you'd already loaded threw away perfectly good data and forced every card
+// back through a "Checking…" flash. Now the cached board renders immediately and is
+// simply refreshed underneath — a background loadBoards() call still gets the latest
+// live times, but the card itself doesn't disappear and reappear to show it.
+el("dir-am").onclick = () => { direction = "am"; renderHome(); loadBoards(); };
+el("dir-pm").onclick = () => { direction = "pm"; renderHome(); loadBoards(); };
 initPull();
 
 /* ---- boot ---- */

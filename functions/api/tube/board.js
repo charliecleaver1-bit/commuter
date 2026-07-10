@@ -54,6 +54,17 @@ export async function onRequest(context) {
   if (!stop) return json({ error: "Missing 'stop' StopPoint id, e.g. ?stop=940GZZLUWLO" }, 400);
 
   try {
+    // Line status only depends on `line`, not on the resolved stop id, so it doesn't
+    // need to wait behind canonicalStop()+arrivals. Kicking it off up front turns two
+    // sequential round-trips into one — this was a meaningful chunk of the "takes a
+    // long time to load" delay on tube legs (previously: canonicalStop → arrivals →
+    // status, one after another; now: canonicalStop → arrivals, in parallel with status).
+    const statusPromise = line
+      ? fetch(`${TFL}/Line/${line}/Status${auth(env)}`, { headers: { Accept: "application/json" } })
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => null)
+      : Promise.resolve(null);
+
     const stopId = await canonicalStop(env, stop);
     // 1) Live arrivals at the stop (optionally scoped to one line for fewer results).
     const arrivalsUrl = line
@@ -74,18 +85,15 @@ export async function onRequest(context) {
     let severity = "on_time";
     let lineStatusDesc = "Good Service";
     let lineStatusLevel = 10;
-    if (line) {
-      const sResp = await fetch(`${TFL}/Line/${line}/Status${auth(env)}`, { headers: { Accept: "application/json" } });
-      if (sResp.ok) {
-        const status = await sResp.json();
-        const ls = status?.[0]?.lineStatuses?.[0];
-        if (ls) {
-          lineStatusDesc = ls.statusSeverityDescription || "Good Service";
-          lineStatusLevel = typeof ls.statusSeverity === "number" ? ls.statusSeverity : 10;
-          if (ls.statusSeverity !== 10) {
-            disruptionReason = ls.reason || ls.statusSeverityDescription || null;
-            severity = "delayed";
-          }
+    const status = await statusPromise;
+    if (status) {
+      const ls = status?.[0]?.lineStatuses?.[0];
+      if (ls) {
+        lineStatusDesc = ls.statusSeverityDescription || "Good Service";
+        lineStatusLevel = typeof ls.statusSeverity === "number" ? ls.statusSeverity : 10;
+        if (ls.statusSeverity !== 10) {
+          disruptionReason = ls.reason || ls.statusSeverityDescription || null;
+          severity = "delayed";
         }
       }
     }
