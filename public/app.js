@@ -557,18 +557,6 @@ function renderTimes(leg, board) {
   return `<div class="times-row"><div class="time-next ${cls}">${esc(nextLabel)}${showUnit ? '<span>min</span>' : ""}</div>${restLabel ? `<div class="time-rest">${esc(restLabel)}</div>` : ""}</div>`;
 }
 
-// TfL's disruption reason text can be a full paragraph. The digest at the top is meant
-// to be a quick summary, not the whole notice, so cut it down to roughly one sentence
-// (or a hard character cap if even the first sentence runs long). The full, un-cut text
-// still shows in the leg detail view — this only shortens what's on the home screen.
-function shortReason(reason, maxLen = 70) {
-  if (!reason) return "";
-  const cut = reason.search(/[.!?](\s|$)/);
-  let s = cut > 0 && cut < maxLen ? reason.slice(0, cut + 1) : reason;
-  if (s.length > maxLen) s = s.slice(0, maxLen - 1).trimEnd() + "…";
-  return s;
-}
-
 function renderDigest(legs) {
   const host = el("summary");
   const issues = legs.map((leg) => ({ leg, st: legStatus(leg, boards[leg.id]) }))
@@ -579,7 +567,8 @@ function renderDigest(legs) {
     host.innerHTML = `<div class="summary good"><span class="dot"></span><div class="summary-lines"><span class="summary-head">${direction === "pm" ? "Your way home looks clear" : "Your commute looks clear"}</span><span class="summary-sub">Good service on all ${legs.length} leg${legs.length > 1 ? "s" : ""}</span></div></div>`;
     return;
   }
-  const lines = issues.map((x) => `<span class="summary-sub">${esc(titleFor(x.leg))} — ${esc(x.st.label)}${x.st.reason ? ": " + esc(shortReason(x.st.reason)) : ""}</span>`).join("");
+  // Just which leg and how bad — no reason text here at all. Tap the card for that.
+  const lines = issues.map((x) => `<span class="summary-sub">${esc(titleFor(x.leg))} — ${esc(x.st.label)}</span>`).join("");
   host.innerHTML = `<div class="summary bad"><span class="dot"></span><div class="summary-lines"><span class="summary-head">${issues.length} issue${issues.length > 1 ? "s" : ""} on your ${direction === "pm" ? "way home" : "commute"}</span>${lines}</div></div>`;
 }
 
@@ -739,8 +728,9 @@ function openLegDetail(leg) {
       const big = isRail ? (s.std || s.estimated || "") : (s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown + " min") : "");
       const live = leg.mode === "tube" && s.currentLocation ? `<div class="detail-live">${esc(s.currentLocation)}</div>` : "";
       const svcId = isRail ? (s.serviceID || "") : "";
+      const chevron = svcId ? '<svg class="detail-chevron" data-chevron viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>' : "";
       return `<div class="detail-row${svcId ? " clickable" : ""}" ${svcId ? `data-svc-id="${esc(svcId)}"` : ""}>
-        <div class="detail-row-top"><span class="detail-time">${esc(big)}</span><span class="detail-dest">${esc(s.destination || "")}</span><span class="leg-badge ${s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "good"}">${esc(s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? "exp " + s.estimated : "Delayed") : (s.platform ? "Pl " + s.platform : "On time"))}</span></div>
+        <div class="detail-row-top"><span class="detail-time">${esc(big)}</span><span class="detail-dest">${esc(s.destination || "")}</span><span class="leg-badge ${s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "good"}">${esc(s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? "exp " + s.estimated : "Delayed") : (s.platform ? "Pl " + s.platform : "On time"))}</span>${chevron}</div>
         ${live}
         ${svcId ? '<div class="detail-expand" data-expand hidden></div>' : ""}
       </div>`;
@@ -758,10 +748,14 @@ function openLegDetail(leg) {
 // earlier working that likely forms it. Lazy: nothing is fetched until you tap.
 async function toggleServiceDetail(row) {
   const panel = row.querySelector("[data-expand]");
+  const chevron = row.querySelector("[data-chevron]");
   if (!panel) return;
-  if (!panel.hidden) { panel.hidden = true; return; }
-  row.parentElement.querySelectorAll(".detail-expand:not([hidden])").forEach((p) => { if (p !== panel) p.hidden = true; });
+  if (!panel.hidden) { panel.hidden = true; chevron?.classList.remove("open"); return; }
+  row.parentElement.querySelectorAll(".detail-expand:not([hidden])").forEach((p) => {
+    if (p !== panel) { p.hidden = true; p.closest(".detail-row")?.querySelector("[data-chevron]")?.classList.remove("open"); }
+  });
   panel.hidden = false;
+  chevron?.classList.add("open");
   if (panel.dataset.loaded) return;
   panel.innerHTML = '<p class="hint" style="padding:6px 0">Loading live position…</p>';
   try {
