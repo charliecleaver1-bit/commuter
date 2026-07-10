@@ -444,6 +444,7 @@ function cssEsc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : String(s)
 
 function legStatus(leg, board) {
   if (!board) return { card: "", badge: "checking", label: "…", reason: null };
+  if (board._error) return { card: "problem", badge: "bad", label: "Couldn't load", reason: board._error };
   if (leg.mode === "tube") {
     // status from line status severity if present
     const sev = board.lineStatusLevel;
@@ -464,6 +465,7 @@ function legStatus(leg, board) {
 }
 
 function renderTimes(leg, board) {
+  if (board?._error) return `<span class="times-empty">Couldn't load: ${esc(board._error)}</span>`;
   if (!board || !board.services || !board.services.length) return '<span class="times-empty">No live times right now</span>';
   const svcs = board.services.slice(0, 4);
   return svcs.map((s, i) => {
@@ -518,11 +520,22 @@ async function loadBoards() {
       if (controller.signal.aborted) return;
       boards[leg.id] = b;
     } catch (e) {
-      if (controller.signal.aborted) return;   // cancelled by a newer toggle/refresh — not a real failure
-      boards[leg.id] = { services: [] };
+      if (controller.signal.aborted || e.name === "AbortError") return;   // cancelled by a newer toggle/refresh — not a real failure
+      boards[leg.id] = { services: [], _error: e.message || "network error" };
     }
     if (!controller.signal.aborted && !el("screen-home").hidden) renderHome();
   }));
+}
+
+// Reads the board endpoint's own error body (board.js returns { error, status } on a
+// non-2xx) so a real failure — e.g. TfL rate-limiting an unauthenticated request —
+// shows up as "Couldn't load: HTTP 502 (upstream 429)" instead of silently rendering
+// exactly like "no trains due right now". If this keeps happening, that string is the
+// thing to look at: 429 specifically means TfL's rate limit, which TFL_APP_KEY fixes.
+async function describeFailure(r) {
+  let detail = null;
+  try { detail = await r.json(); } catch (e) {}
+  return `HTTP ${r.status}${detail?.status ? ` (upstream ${detail.status})` : ""}`;
 }
 
 async function fetchBoard(leg, signal) {
@@ -530,12 +543,14 @@ async function fetchBoard(leg, signal) {
     // Direction filtering removed for now — this shows all arrivals on the line at
     // this stop, both directions, unfiltered. Being revisited later.
     const r = await fetch(`/api/tube/board?stop=${encodeURIComponent(leg.from_id)}&line=${encodeURIComponent(leg.line)}`, { signal });
-    return r.ok ? await r.json() : { services: [] };
+    if (!r.ok) return { services: [], _error: await describeFailure(r) };
+    return await r.json();
   }
   if (leg.mode === "bus") {
     const stop = leg._reversed ? (leg.rev_from_id || leg.from_id) : leg.from_id;
     const r = await fetch(`/api/bus/board?stop=${encodeURIComponent(stop)}&line=${encodeURIComponent(leg.route || leg.line)}`, { signal });
-    const board = r.ok ? await r.json() : { services: [] };
+    if (!r.ok) return { services: [], _error: await describeFailure(r) };
+    const board = await r.json();
     try {
       const dr = await fetch(`/api/bus/disruption?lines=${encodeURIComponent(leg.route || leg.line)}`, { signal });
       const dd = await dr.json();
@@ -544,7 +559,8 @@ async function fetchBoard(leg, signal) {
     return board;
   }
   const r = await fetch(`/api/rail/board?from=${encodeURIComponent(leg.from_id)}&to=${encodeURIComponent(leg.to_id)}`, { signal });
-  return r.ok ? await r.json() : { services: [] };
+  if (!r.ok) return { services: [], _error: await describeFailure(r) };
+  return await r.json();
 }
 
 /* ---- refresh: button (flashes green), pull-to-refresh, auto 20s ---- */
@@ -558,10 +574,22 @@ async function doRefresh(fromButton) {
 }
 function startAutoRefresh() {
   stopAutoRefresh();
-  refreshTimer = setInterval(() => { if (!el("screen-home").hidden) loadBoards(); }, 20000);
+  // Mobile browsers (especially iOS Safari, and this as an installed PWA) commonly
+  // suspend timers and in-flight network activity while backgrounded, then resume them
+  // in an inconsistent state — a fetch that was "in progress" when the screen locked can
+  // sit stalled for the rest of its natural life. Skipping refreshes while hidden avoids
+  // starting fetches that are likely to end up in that state, and refreshing immediately
+  // on return to foreground means you're not waiting up to 20s for the next tick — and
+  // aren't looking at whatever got stuck while the tab was away.
+  refreshTimer = setInterval(() => {
+    if (!el("screen-home").hidden && document.visibilityState === "visible") loadBoards();
+  }, 20000);
   tick = setInterval(tickCountdowns, 1000);
 }
 function stopAutoRefresh() { clearInterval(refreshTimer); clearInterval(tick); }
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && !el("screen-home").hidden) loadBoards();
+});
 
 // live countdown decrement between fetches (visual only)
 function tickCountdowns() {
