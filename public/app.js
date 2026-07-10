@@ -419,13 +419,14 @@ function legSkeleton(leg, i, total) {
       </div>
       <div class="leg-route">${esc(leg.from_name)} → ${esc(leg.to_name)}</div>
       <div class="times" data-times><span class="times-empty">Checking…</span></div>
-      <div class="leg-reason" data-reason hidden></div>
     </button></div>`;
 }
 
-// Patch one card's content in place — badge, times, reason, and the problem/problem-amber
-// state class — without touching the surrounding DOM nodes. This is what makes board
-// refreshes (initial load, direction resolution, 20s auto-refresh) silent instead of flashy.
+// Patch one card's content in place — badge + times, and the problem/problem-amber card
+// state — without touching the surrounding DOM nodes. This is what makes board refreshes
+// (initial load, 20s auto-refresh) silent instead of flashy. The full delay reason is
+// deliberately NOT shown here — it lives in the digest at the top only, so a single
+// disrupted leg doesn't blow the card up to take over the screen.
 function updateLegCard(leg) {
   const card = document.querySelector(`.leg-card[data-leg="${cssEsc(leg.id)}"]`);
   if (!card) return;
@@ -436,9 +437,6 @@ function updateLegCard(leg) {
   badge.className = `leg-badge ${st.badge}`;
   badge.textContent = st.label;
   card.querySelector("[data-times]").innerHTML = renderTimes(leg, board);
-  const reasonEl = card.querySelector("[data-reason]");
-  if (st.reason) { reasonEl.hidden = false; reasonEl.textContent = st.reason; }
-  else { reasonEl.hidden = true; reasonEl.textContent = ""; }
 }
 function cssEsc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"); }
 
@@ -446,10 +444,12 @@ function legStatus(leg, board) {
   if (!board) return { card: "", badge: "checking", label: "…", reason: null };
   if (board._error) return { card: "problem", badge: "bad", label: "Couldn't load", reason: board._error };
   if (leg.mode === "tube") {
-    // status from line status severity if present
+    // Status from line status severity if present. Card badge stays a plain
+    // good/bad/delay summary — the specific reason (signal failure, etc.) only shows
+    // in the top digest, via the `reason` field below.
     const sev = board.lineStatusLevel;
-    if (sev != null && sev < 6) return { card: "problem", badge: "bad", label: board.lineStatus || "Disrupted", reason: board.lineReason };
-    if (sev != null && sev < 10) return { card: "problem-amber", badge: "delay", label: board.lineStatus || "Delays", reason: board.lineReason };
+    if (sev != null && sev < 6) return { card: "problem", badge: "bad", label: "Bad service", reason: board.lineReason };
+    if (sev != null && sev < 10) return { card: "problem-amber", badge: "delay", label: "Minor delay", reason: board.lineReason };
     return { card: "", badge: "good", label: "Good service", reason: null };
   }
   if (leg.mode === "bus") {
@@ -458,8 +458,8 @@ function legStatus(leg, board) {
   }
   // rail
   const svcs = board.services || [];
-  if (svcs.some((s) => s.status === "cancelled")) return { card: "problem", badge: "bad", label: "Cancellations", reason: svcs.find((s) => s.cancelReason)?.cancelReason || null };
-  if (svcs.some((s) => s.status === "delayed")) return { card: "problem-amber", badge: "delay", label: "Delays", reason: svcs.find((s) => s.delayReason)?.delayReason || null };
+  if (svcs.some((s) => s.status === "cancelled")) return { card: "problem", badge: "bad", label: "Bad service", reason: svcs.find((s) => s.cancelReason)?.cancelReason || null };
+  if (svcs.some((s) => s.status === "delayed")) return { card: "problem-amber", badge: "delay", label: "Minor delay", reason: svcs.find((s) => s.delayReason)?.delayReason || null };
   if (!svcs.length) return { card: "", badge: "checking", label: "No live info", reason: null };
   return { card: "", badge: "good", label: "On time", reason: null };
 }
@@ -468,19 +468,19 @@ function renderTimes(leg, board) {
   if (board?._error) return `<span class="times-empty">Couldn't load: ${esc(board._error)}</span>`;
   if (!board || !board.services || !board.services.length) return '<span class="times-empty">No live times right now</span>';
   const svcs = board.services.slice(0, 4);
-  return svcs.map((s, i) => {
-    const isNext = i === 0;
-    const cls = s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "";
-    let big, sub;
-    if (leg.mode === "rail") {
-      big = s.status === "cancelled" ? "Canc" : (s.std || s.estimated || "—");
-      sub = s.status === "delayed" && s.estimated ? "exp " + s.estimated : (s.platform ? "Pl " + s.platform : (s.destination || ""));
-    } else {
-      big = s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown + " min") : (s.etd || "—");
-      sub = isNext && s.destination ? "to " + s.destination : "";
-    }
-    return `<div class="time-chip ${isNext ? "next " + cls : ""}"><div class="time-big">${esc(big)}</div>${sub ? `<div class="time-sub">${esc(sub)}</div>` : ""}</div>`;
-  }).join("");
+  const isRail = leg.mode === "rail";
+  // Destination is deliberately left off here — it's only useful once you've actually
+  // decided to look, which is what the leg detail view (openLegDetail) is for.
+  const fmt = (s) => isRail
+    ? (s.status === "cancelled" ? "Canc" : (s.std || s.estimated || "—"))
+    : (s.countdown != null ? (s.countdown <= 1 ? "Due" : String(s.countdown)) : (s.etd || "—"));
+  const next = svcs[0];
+  const cls = next.status === "cancelled" ? "bad" : next.status === "delayed" ? "delay" : "";
+  const nextLabel = fmt(next);
+  const showUnit = !isRail && next.countdown != null && next.countdown > 1;
+  const rest = svcs.slice(1).map(fmt);
+  const restLabel = rest.length ? rest.join(" · ") + (isRail ? "" : " min") : "";
+  return `<div class="time-next ${cls}">${esc(nextLabel)}${showUnit ? '<span>min</span>' : ""}</div>${restLabel ? `<div class="time-rest">${esc(restLabel)}</div>` : ""}`;
 }
 
 function renderDigest(legs) {
@@ -591,10 +591,10 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && !el("screen-home").hidden) loadBoards();
 });
 
-// live countdown decrement between fetches (visual only)
+// live countdown decrement between fetches (visual only) — currently a no-op;
+// countdowns are simply refetched every 20s instead.
 function tickCountdowns() {
   if (el("screen-home").hidden) return;
-  document.querySelectorAll(".time-chip .time-big").forEach(() => {}); // countdowns refetched every 20s; keep simple
 }
 
 /* pull-to-refresh */

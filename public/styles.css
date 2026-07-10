@@ -164,19 +164,19 @@ h2 { font-family: var(--display); font-weight: 600; font-size: 20px; letter-spac
 .leg-badge.bad { background: var(--bad-wash); color: var(--bad); }
 .leg-badge.checking { background: var(--surface-2); color: var(--ink-soft); }
 
-/* countdowns — departure-board style */
-.times { display: flex; gap: 8px; flex-wrap: wrap; }
-.time-chip {
-  font-family: var(--mono); background: var(--surface-2); border-radius: var(--r-sm);
-  padding: 8px 11px; min-width: 58px; text-align: center;
+/* countdowns — departure-board style: one emphasised "next" value, the rest as a
+   quiet trailing list, so a card never needs more than one line for times. */
+.times { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.time-next {
+  font-family: var(--mono); background: var(--ink); color: #fff; font-weight: 700;
+  font-size: 19px; letter-spacing: -.02em; line-height: 1; padding: 7px 12px;
+  border-radius: var(--r-sm); display: inline-flex; align-items: baseline; gap: 4px;
 }
-.time-chip.next { background: var(--ink); color: #fff; }
-.time-chip.next.delay { background: var(--delay); }
-.time-chip.next.bad { background: var(--bad); }
-.time-big { font-size: 17px; font-weight: 700; letter-spacing: -.02em; line-height: 1.1; }
-.time-sub { font-size: 10.5px; opacity: .7; font-weight: 500; margin-top: 1px; }
+.time-next span { font-size: 10.5px; font-weight: 600; opacity: .75; }
+.time-next.delay { background: var(--delay); }
+.time-next.bad { background: var(--bad); }
+.time-rest { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); letter-spacing: -.01em; }
 .times-empty { color: var(--ink-faint); font-size: 13px; font-style: italic; }
-.leg-reason { margin-top: 10px; font-size: 12.5px; color: var(--ink-soft); line-height: 1.45; padding-top: 10px; border-top: 1px solid var(--line); }
 
 /* refresh button states */
 #btn-refresh.spinning { animation: spin .8s linear infinite; color: var(--primary); }
