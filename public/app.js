@@ -205,9 +205,15 @@ function renderRailBody(host, leg) {
     if (!leg.from_id || !leg.to_id) { vBox.hidden = true; leg._valid = null; return; }
     vBox.hidden = false; vBox.className = "validate checking"; vBox.textContent = "Checking for a direct train…";
     const result = await checkDirect(leg.from_id, leg.to_id);
-    leg._valid = result !== "no";
-    if (result === "yes") { vBox.className = "validate ok"; vBox.textContent = "✓ Direct train confirmed"; }
-    else if (result === "unknown") { vBox.className = "validate checking"; vBox.textContent = "Couldn't confirm a direct train right now — you can still save, and it'll check again live."; }
+    leg._valid = result.status !== "no";
+    // Persist the "via" disambiguation text seen on the confirmed-direct service, if
+    // any — used at board time to filter out the long-way-round direction on loop
+    // lines (Kingston Loop etc). Most routes have no such ambiguity, so this stays
+    // null/absent for them and nothing gets filtered — this only ever activates where
+    // Darwin itself reports the ambiguity, not something specific to any one route.
+    if (result.status === "yes") leg.expectedVia = result.via || null;
+    if (result.status === "yes") { vBox.className = "validate ok"; vBox.textContent = "✓ Direct train confirmed"; }
+    else if (result.status === "unknown") { vBox.className = "validate checking"; vBox.textContent = "Couldn't confirm a direct train right now — you can still save, and it'll check again live."; }
     else { vBox.className = "validate bad"; vBox.innerHTML = "No direct train found. If you change trains, add one leg each — you can still save."; }
   };
   ["from", "to"].forEach((which) => {
@@ -301,13 +307,16 @@ function stationField(label, val, which) {
     </div></div>`;
 }
 
-// Returns "yes" | "no" | "unknown". The previous version only had a boolean, which
-// meant two real bugs collapsed into a false "not direct": (1) the D1 timetable table
-// exists but was never actually populated by an ingest run, so every query came back
-// "empty" and was trusted as proof of no direct train; (2) if the live-board fallback
-// request itself failed (network blip, RDM downtime — the LAST line of defence), that
-// was silently read the same as "checked and found nothing". Both are now surfaced as
-// "unknown" instead, which the UI treats as inconclusive rather than a hard no.
+// Returns { status: "yes"|"no"|"unknown", via }. The previous version only had a
+// boolean, which meant two real bugs collapsed into a false "not direct": (1) the D1
+// timetable table exists but was never actually populated by an ingest run, so every
+// query came back "empty" and was trusted as proof of no direct train; (2) if the
+// live-board fallback request itself failed (network blip, RDM downtime — the LAST
+// line of defence), that was silently read the same as "checked and found nothing".
+// Both are now surfaced as "unknown" instead, which the UI treats as inconclusive
+// rather than a hard no. `via` is Darwin's route-disambiguation text (e.g. "via
+// Kingston") from whichever confirmed-direct service was found, used to filter the
+// long-way-round direction on loop lines later — null when there's no such ambiguity.
 async function checkDirect(from, to) {
   let timetableHasData = false;
   try {
@@ -317,25 +326,25 @@ async function checkDirect(from, to) {
       const d = await r.json();
       if (d.dataAvailable === false) continue; // table not populated — don't trust "empty" from it
       timetableHasData = true;
-      if (d.services && d.services.length) return "yes";
+      if (d.services && d.services.length) return { status: "yes", via: null };   // D1 timetable schema has no via column
     }
   } catch (e) {}
   // The timetable genuinely has data and searched every sampled window without a hit —
   // trust that as a real "no".
-  if (timetableHasData) return "no";
+  if (timetableHasData) return { status: "no", via: null };
 
   // Timetable unavailable — fall back to the live board.
   try {
     const r = await fetch(`/api/rail/validate?from=${from}&to=${to}`);
-    if (!r.ok) return "unknown";
+    if (!r.ok) return { status: "unknown", via: null };
     const d = await r.json();
-    if (d.direct === true) return "yes";
+    if (d.direct === true) return { status: "yes", via: (d.sample && d.sample[0] && d.sample[0].via) || null };
     // stationHasServices means Darwin found real trains running from `from` right now,
     // just none calling at `to` — solid evidence either way. If the board had nothing
     // in view at all (e.g. the middle of the night), that's inconclusive, not a "no".
-    if (d.stationHasServices) return "no";
-    return "unknown";
-  } catch (e) { return "unknown"; }
+    if (d.stationHasServices) return { status: "no", via: null };
+    return { status: "unknown", via: null };
+  } catch (e) { return { status: "unknown", via: null }; }
 }
 
 let boards = {};                // legId -> board data
@@ -419,6 +428,10 @@ function reverseLeg(leg) {
     // time — no lookup here, ever. stepFree isn't direction-specific so it carries
     // over automatically via the ...leg spread above.
     tubeDir: leg.tubeDirRev, tubeOnward: leg.tubeOnwardRev, tubeOnwardIds: leg.tubeOnwardIdsRev,
+    // Rail: expectedVia was only captured for the AM (as-configured) direction — the
+    // return journey may have a different via text (or none), so don't carry it over
+    // and risk filtering the reverse leg's board against the wrong expectation.
+    expectedVia: null,
     // bus: opposite-direction stops resolved lazily; keep route + flip dir token
     direction: leg.direction === "inbound" ? "outbound" : leg.direction === "outbound" ? "inbound" : leg.direction,
   };
@@ -653,7 +666,19 @@ async function fetchBoard(leg, signal) {
   }
   const r = await fetch(`/api/rail/board?from=${encodeURIComponent(leg.from_id)}&to=${encodeURIComponent(leg.to_id)}`, { signal });
   if (!r.ok) return { services: [], _error: await describeFailure(r) };
-  return await r.json();
+  const board = await r.json();
+  // Filter out the long-way-round direction on loop lines (Kingston Loop etc), using
+  // Darwin's own "via" disambiguation text captured once during setup validation —
+  // see checkDirect(). Only ever activates when the route genuinely has this ambiguity
+  // (expectedVia set) AND a service's via text is present and differs; if filtering
+  // would leave nothing, show everything rather than risk an empty board — a train
+  // going the long way is still better than the app looking broken.
+  if (leg.expectedVia && board.services?.length) {
+    const wantVia = leg.expectedVia.toLowerCase();
+    const filtered = board.services.filter((s) => !s.via || s.via.toLowerCase() === wantVia);
+    if (filtered.length) board.services = filtered;
+  }
+  return board;
 }
 
 /* ---- refresh: button (flashes green), pull-to-refresh, auto 20s ---- */
@@ -734,7 +759,7 @@ function openLegDetail(leg) {
       const svcId = s.serviceID || "";
       const chevron = svcId ? '<svg class="detail-chevron" data-chevron viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>' : "";
       return `<div class="detail-row${svcId ? " clickable" : ""}" ${svcId ? `data-svc-id="${esc(svcId)}"` : ""}>
-        <div class="detail-row-top"><span class="detail-time">${esc(big)}</span><span class="detail-dest">${esc(s.destination || "")}</span><span class="leg-badge ${s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "good"}">${esc(s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? "exp " + s.estimated : "Delayed") : (s.platform ? "Pl " + s.platform : "On time"))}</span>${chevron}</div>
+        <div class="detail-row-top"><span class="detail-time">${esc(big)}</span><span class="detail-dest">${esc(s.destination || "")}</span><span class="leg-badge ${s.status === "cancelled" ? "bad" : s.status === "delayed" ? "delay" : "good"}">${esc(s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? "exp " + s.estimated : "Delayed") : (s.platform ? "Platform " + s.platform : "On time"))}</span>${chevron}</div>
         ${svcId ? '<div class="detail-expand" data-expand hidden></div>' : ""}
       </div>`;
     }).join("") : '<p class="hint">No live services right now.</p>'}`;
@@ -816,10 +841,21 @@ function minutesBetween(a, b) {
 // The rich header — destination, "calls X", DEPARTS time, status line, big countdown,
 // platform + operator — matching the reference app's layout as closely as the data allows.
 function renderRailPanel(leg, s, d) {
-  const destStop = (d.stops || []).find((x) => x.crs === leg.to_id) || (d.stops || []).find((x) => x.name && leg.to_name && x.name.toLowerCase() === leg.to_name.toLowerCase());
+  // Only search stops that are still ahead (not yet passed). Loop services — very
+  // common on SWR routes toward Waterloo via Kingston/Hounslow, which is exactly what
+  // New Malden sits on — can legitimately call at the SAME station twice in one
+  // journey: once at the very start (already departed, has an actual time) and once
+  // as the real destination. Searching the full list picked up the wrong (earlier,
+  // already-passed) occurrence, which produced a nonsense negative-wrapped duration
+  // like "1385 min". Restricting to unpassed stops fixes that at the source.
+  const futureStops = (d.stops || []).filter((x) => !x.passed);
+  const destStop = futureStops.find((x) => x.crs === leg.to_id) || futureStops.find((x) => x.name && leg.to_name && x.name.toLowerCase() === leg.to_name.toLowerCase());
   const arrAtDest = destStop ? (destStop.atd || destStop.etd || destStop.std) : null;
   const depTime = s.std || s.estimated || "";
-  const durMin = arrAtDest ? minutesBetween(depTime, arrAtDest) : null;
+  let durMin = arrAtDest ? minutesBetween(depTime, arrAtDest) : null;
+  // Defensive backstop: no leg in a commute should genuinely take several hours. If the
+  // computed duration is implausible, don't show a wrong number — just omit it.
+  if (durMin != null && (durMin < 0 || durMin > 300)) durMin = null;
   const countdown = s.countdown != null ? (s.countdown <= 1 ? "Due" : s.countdown) : null;
   const countdownUnit = s.countdown != null && s.countdown > 1 ? "min" : "";
   const statusWord = s.status === "cancelled" ? "Cancelled" : s.status === "delayed" ? (s.estimated ? `exp ${s.estimated}` : "Delayed") : "On time";

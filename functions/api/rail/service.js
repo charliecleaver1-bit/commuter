@@ -79,9 +79,9 @@ export async function onRequest(context) {
   }
 
   try {
-    const inbound = await inferInbound(env, svc);
-    if (inbound) result.inbound = inbound;
-    else result._inboundNote = "No inbound working could be inferred (needs a platform + a same-platform arrival within a plausible turnaround window).";
+    const result2 = await inferInbound(env, svc);
+    if (result2.inbound) result.inbound = result2.inbound;
+    else result._inboundNote = result2.reason || "No inbound working could be inferred.";
   } catch (e) {
     // Surfaced (not swallowed) so "why is Formed By missing" is answerable — most
     // likely cause is DARWIN_ARRIVALS_PRODUCT/DARWIN_ARRIVALS_APIKEY not set yet,
@@ -182,13 +182,17 @@ function timeToMinutesToday(hhmmStr) {
   return m ? (+m[1]) * 60 + (+m[2]) : null;
 }
 
+// Returns { inbound } on a match, or { reason } explaining specifically why not —
+// "no inbound could be inferred" was too generic to debug; this tells you which of
+// several distinct situations actually happened.
 async function inferInbound(env, svc) {
   const prevAll = (svc.previousCallingPoints && svc.previousCallingPoints[0] && svc.previousCallingPoints[0].callingPoint) || [];
   const origin = prevAll.length ? prevAll[0] : { locationName: svc.locationName, crs: svc.crs, st: svc.std, platform: svc.platform };
-  if (!origin.crs || !origin.st || !origin.platform) return null; // no platform info to go on — not an error, just nothing to infer from
+  if (!origin.crs || !origin.st) return { reason: "This train's own origin/departure time isn't available." };
+  if (!origin.platform) return { reason: `No platform is allocated yet for the ${origin.locationName || "origin"} departure — platforms are often only confirmed shortly before departure, so this can resolve itself closer to the time.` };
 
   const depMin = timeToMinutesToday(origin.st);
-  if (depMin == null) return null;
+  if (depMin == null) return { reason: "Couldn't parse the origin departure time." };
 
   const arrResp = await rdmGet(env, `/GetArrBoardWithDetails/${origin.crs}?numRows=15&timeWindow=45`, "DARWIN_ARRIVALS_PRODUCT");
   if (!arrResp.ok) {
@@ -197,11 +201,14 @@ async function inferInbound(env, svc) {
     throw new Error(`arrivals board error (status ${arrResp.status}): ${(arrResp.detail || "").slice(0, 150)}`.trim());
   }
   const arrivals = Array.isArray(arrResp.data.trainServices) ? arrResp.data.trainServices : [];
+  if (!arrivals.length) return { reason: `The arrivals board at ${origin.locationName || origin.crs} has nothing in view right now (45 min window).` };
 
-  let best = null, bestMin = -Infinity;
+  let best = null, bestMin = -Infinity, sameStationCount = 0, samePlatformCount = 0;
   for (const a of arrivals) {
+    sameStationCount++;
     const plat = a.platform;
     if (!plat || String(plat) !== String(origin.platform)) continue;   // same platform — turnarounds almost always reuse it
+    samePlatformCount++;
     const arrTime = a.ata || a.eta || a.sta;
     const arrMin = timeToMinutesToday(arrTime);
     if (arrMin == null) continue;
@@ -210,9 +217,12 @@ async function inferInbound(env, svc) {
     if (gap < 2 || gap > 35) continue;   // plausible turnaround window
     if (arrMin > bestMin) { bestMin = arrMin; best = a; }
   }
-  if (!best) return null; // queried fine, genuinely no plausible match — not an error
+  if (!best) {
+    if (!samePlatformCount) return { reason: `${sameStationCount} arrival${sameStationCount === 1 ? "" : "s"} in view at ${origin.locationName || origin.crs}, but none on platform ${origin.platform} — nothing plausible to link.` };
+    return { reason: `${samePlatformCount} arrival${samePlatformCount === 1 ? "" : "s"} on platform ${origin.platform}, but none within a plausible 2–35 min turnaround window before the ${origin.st} departure.` };
+  }
   const inId = best.serviceIdPercentEncoded || best.serviceID;
-  if (!inId) return null;
+  if (!inId) return { reason: "Found a plausible inbound arrival but it had no service ID to look up." };
 
   const inResp = await rdmGet(env, `/GetServiceDetails/${encodeURIComponent(inId)}`, "DARWIN_SERVICE_PRODUCT");
   if (!inResp.ok) {
@@ -220,9 +230,11 @@ async function inferInbound(env, svc) {
   }
   const p = buildProgress(inResp.data);
   return {
-    origin: p.origin, destination: p.destination, operator: p.operator, stops: p.stops, pos: p.pos,
-    platform: origin.platform,
-    dueArr: hhmm(best.sta), expectedArr: hhmm(best.eta) || hhmm(best.ata),
-    inferred: true,
+    inbound: {
+      origin: p.origin, destination: p.destination, operator: p.operator, stops: p.stops, pos: p.pos,
+      platform: origin.platform,
+      dueArr: hhmm(best.sta), expectedArr: hhmm(best.eta) || hhmm(best.ata),
+      inferred: true,
+    },
   };
 }

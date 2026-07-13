@@ -61,6 +61,9 @@ export async function onRequest(context) {
         sample: services.slice(0, 3).map((s) => ({
           std: s.std,
           destination: Array.isArray(s.destination) && s.destination[0] ? s.destination[0].locationName : null,
+          // Darwin's disambiguation text for ambiguous/loop routes (e.g. "via Kingston").
+          // null/absent means this route has no such ambiguity to worry about.
+          via: Array.isArray(s.destination) && s.destination[0] ? s.destination[0].via || null : null,
         })),
       });
     }

@@ -35,6 +35,11 @@ function classify(etd, isCancelled) {
 
 // destination/origin come back as arrays of location objects
 const firstLoc = (arr) => (Array.isArray(arr) && arr[0] ? arr[0].locationName : null);
+// "via" is Darwin's own disambiguation text for services on ambiguous/loop routes (e.g.
+// "via Kingston" vs "via Twickenham") — documented as appearing on real departure
+// boards specifically to distinguish these cases. Used to filter out the long-way-round
+// direction on loop lines (see fetchBoard's rail branch in app.js).
+const firstVia = (arr) => (Array.isArray(arr) && arr[0] ? arr[0].via || null : null);
 
 export async function onRequest(context) {
   const { request, env } = context;
@@ -95,6 +100,7 @@ export async function onRequest(context) {
       delayReason: s.delayReason || null,
       cancelReason: s.cancelReason || null,
       destination: firstLoc(s.destination),
+      via: firstVia(s.destination),
       origin: firstLoc(s.origin), // the "formed by" hint
     };
   });
